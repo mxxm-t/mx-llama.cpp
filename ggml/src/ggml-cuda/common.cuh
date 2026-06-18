@@ -1391,10 +1391,28 @@ struct ggml_cuda_stream_context {
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
+    // Upload-only backends use the per-thread stream so temporary model-load copies do not
+    // create/destroy normal HIP streams before the compute backend is initialized.
+    bool copy_only = false;
     cudaEvent_t copy_event = nullptr;
+
+    // Dedicated stream + events for the meta-backend stage-transfer copies. Using a side
+    // stream avoids serializing the cross-stage memcpy behind compute on the main stream,
+    // so the next ubatch's stage-A compute can start on the source GPU while the prior
+    // ubatch's stage-A->stage-B copy is still in flight on the dedicated stream.
+    cudaStream_t pp_copy_stream  = nullptr;
+    cudaEvent_t  pp_copy_event_a = nullptr; // src main -> pp_copy_stream
+    cudaEvent_t  pp_copy_event_b = nullptr; // pp_copy_stream -> dst main
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+
+#if defined(GGML_USE_HIP)
+    // Pinned-host scratch for set_tensor_2d_async's misaligned-row workaround. See the
+    // comment at ggml_backend_cuda_set_tensor_2d_async for the why.
+    void * hip_set2d_scratch_ptr = nullptr;
+    size_t hip_set2d_scratch_cap = 0;
+#endif
 
     int curr_stream_no = 0;
 
@@ -1450,9 +1468,10 @@ struct ggml_backend_cuda_context {
     }
 #endif // USE_CUDA_GRAPH
 
-    explicit ggml_backend_cuda_context(int device) :
+    explicit ggml_backend_cuda_context(int device, bool copy_only = false) :
         device(device),
-        name(GGML_CUDA_NAME + std::to_string(device)) {
+        name(GGML_CUDA_NAME + std::to_string(device)),
+        copy_only(copy_only) {
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
@@ -1460,6 +1479,12 @@ struct ggml_backend_cuda_context {
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {
+        if (copy_only) {
+            GGML_ASSERT(device == this->device);
+            GGML_ASSERT(stream == 0);
+            ggml_cuda_set_device(device);
+            return cudaStreamPerThread;
+        }
         if (streams[device][stream] == nullptr) {
             ggml_cuda_set_device(device);
             CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));

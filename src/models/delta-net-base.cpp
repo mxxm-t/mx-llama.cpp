@@ -459,7 +459,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     const auto kv_head  = mctx_cur->get_head();
     const auto mem_size = mctx_cur->get_size();
 
-    const int64_t n_seqs = ubatch.n_seqs;
+    const int64_t n_seqs       = ubatch.n_seqs;
+    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
     cb(conv_states, "conv_states", il);
@@ -477,7 +478,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
-    if (cparams.n_rs_seq == 0) {
+    if (cparams.n_rs_seq == 0 || n_seq_tokens == 1) {
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
         const int64_t s_slot = 0;
 
@@ -544,7 +545,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_seqs       = s->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
-    const bool keep = cparams.n_rs_seq > 0;
+    const bool keep = cparams.n_rs_seq > 0 && n_seq_tokens > 1;
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);

@@ -206,6 +206,23 @@ extern "C" {
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    typedef bool   (*ggml_backend_comm_sendrecv_tensor_t)(
+        void * comm_ctx, size_t n_pairs,
+        ggml_backend_t * backends_src, ggml_backend_t * backends_dst,
+        const struct ggml_tensor ** srcs, struct ggml_tensor ** dsts);
+
+    // Async copy on a dedicated copy stream (not the source backend's main stream), with
+    // explicit events keeping src->main and dst->main streams correctly ordered. Used by
+    // the meta backend's stage_transfer to avoid serializing cross-stage memcpy behind
+    // compute on src's main stream. Split into a queue + drain pair so dst->main waits
+    // exactly once after all queued memcpys finish; recording the drain event per call
+    // would race when dst->main reaches an early wait against the latest record.
+    // Returns true on success, false if not supported.
+    typedef bool (*ggml_backend_cpy_tensor_async_dedicated_queue_t)(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst,
+        const struct ggml_tensor * src, struct ggml_tensor * dst);
+    typedef bool (*ggml_backend_cpy_tensor_async_dedicated_drain_t)(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst);
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
@@ -397,10 +414,13 @@ extern "C" {
     typedef struct ggml_backend_meta_split_state(*ggml_backend_meta_get_split_state_t)(const struct ggml_tensor * tensor, void * userdata);
 
     // create a new meta device from "simple" devices, meta buffer type/buffer/backend is then derived from this:
+    // tps is the tensor-parallel group size. n_devs must be a multiple of tps; n_stages = n_devs / tps.
+    // tps == 0 means "single TP group covering all devices" (vanilla -sm tensor).
     // TODO: this looks a bit strange - a backend API creates a device. I think we should try
     //       express this as a backend registry functionality instead
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
-        ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+        ggml_backend_dev_t * devs, size_t n_devs, size_t tps,
+        ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
     //
     // Utils

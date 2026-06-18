@@ -98,6 +98,19 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_pre_norm(struct llama_context * ctx, bool value, bool masked);
 
+// Phase 2b: when enabled, the MTP head graph builds and stores ONLY its K/V (skips the
+// discarded attention/FFN/output). Enable around the deferred-prefill replay (a pure prompt
+// KV-build whose head output is unused), disable for generation drafting (which needs logits).
+LLAMA_API void llama_set_mtp_prefill_kv_only(struct llama_context * ctx, bool value);
+
+// Enable (n_tokens_cap > 0) or disable (0) a pinned, position-indexed accumulation buffer
+// into which the unmasked pre-norm extraction also copies each ubatch's hidden rows. Lets
+// the MTP hook stage the whole prompt hidden across decode calls and skip its
+// per-prefill-chunk synchronize. The context owns/allocates the buffer (pinned for fast
+// async D2H); returns its base. The companion getter synchronizes and returns the base.
+LLAMA_API float * llama_set_embeddings_pre_norm_accum(struct llama_context * ctx, int32_t n_tokens_cap);
+LLAMA_API float * llama_get_embeddings_pre_norm_accum(struct llama_context * ctx);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_pre_norm    (struct llama_context * ctx);

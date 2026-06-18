@@ -1,3 +1,15 @@
+<!-- fork banner -->
+> **mx-llama.cpp** is a fork of llama.cpp focused on multi-GPU optimization, with
+> single-GPU and speculative-decoding work alongside. The optimizations are
+> backend-generic; the kernel-level tuning targets AMD gfx906 simply because that
+> is the multi-GPU hardware it is developed and tested on.
+>
+> See **[FEATURES.md](FEATURES.md)** for what it adds and the recommended runtime
+> environment. A prebuilt gfx906 image is on Docker Hub:
+> **[mxxm/mx-llama.cpp](https://hub.docker.com/r/mxxm/mx-llama.cpp)**.
+
+---
+
 # llama.cpp
 
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)

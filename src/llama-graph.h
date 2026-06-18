@@ -996,6 +996,15 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    // Phase 2b: store ONLY k_cur/v_cur into the KV cache (the store half of build_attn, no
+    // attention/output). Used by the MTP head's KV-only prefill replay. Mirrors build_attn's
+    // store block exactly so the stored K/V are bit-identical to the full path.
+    void build_attn_store_kv(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+                    int   il) const;
+
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 
     ggml_tensor * build_attn(

@@ -370,6 +370,12 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
             case 4:
                 return 2;
             case 5:
+                // On gfx906, Q8_0 5-column MMVQ needs the same warp topology
+                // as <=4 columns to keep batched greedy MTP verification exact.
+                if (type == GGML_TYPE_Q8_0) {
+                    return 2;
+                }
+                [[fallthrough]];
             case 6:
             case 7:
             case 8:

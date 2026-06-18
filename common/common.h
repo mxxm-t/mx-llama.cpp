@@ -458,6 +458,7 @@ struct common_params {
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
+    int32_t tensor_parallel_size = 0; // -sm tensor: GPUs per TP group. Rest form pipeline stages. 0 = single TP group
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;

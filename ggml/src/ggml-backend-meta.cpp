@@ -10,12 +10,15 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <set>
 #include <string>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -56,29 +59,36 @@ struct ggml_backend_meta_device_context {
     ggml_backend_meta_get_split_state_t get_split_state;
     void *                              get_split_state_ud;
 
+    size_t tps      = 0; // TP group size (devices in one stage). Equal to simple_devs.size() for single-stage.
+    size_t n_stages = 1; // simple_devs.size() / tps
+
     std::string name;
     std::string description;
 
     ggml_backend_meta_device_context(
-            std::vector<ggml_backend_dev_t> simple_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud) :
+            std::vector<ggml_backend_dev_t> simple_devs, size_t tps,
+            ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud) :
             simple_devs(std::move(simple_devs)), get_split_state(get_split_state), get_split_state_ud(get_split_state_ud) {
+        const size_t n_devs = this->simple_devs.size();
+        this->tps      = (tps == 0) ? n_devs : tps;
+        this->n_stages = n_devs / this->tps;
         name        = std::string("Meta(");
         description = std::string("Meta(");
-        for (size_t i = 0; i < simple_devs.size(); i++) {
+        for (size_t i = 0; i < n_devs; i++) {
             if (i > 0) {
                 name        += ",";
                 description += ",";
             }
-            name        += ggml_backend_dev_name       (simple_devs[i]);
-            description += ggml_backend_dev_description(simple_devs[i]);
+            name        += ggml_backend_dev_name       (this->simple_devs[i]);
+            description += ggml_backend_dev_description(this->simple_devs[i]);
         }
         name        += ")";
         description += ")";
     }
 
     bool operator<(const ggml_backend_meta_device_context & other) const {
-        return std::tie(simple_devs, get_split_state, get_split_state_ud)
-            < std::tie(other.simple_devs, other.get_split_state, other.get_split_state_ud);
+        return std::tie(simple_devs, tps, get_split_state, get_split_state_ud)
+            < std::tie(other.simple_devs, other.tps, other.get_split_state, other.get_split_state_ud);
     }
 };
 
@@ -129,9 +139,9 @@ static void ggml_backend_meta_device_get_props(ggml_backend_dev_t dev, ggml_back
 
     props->caps = {
         /* .async                 = */ true,
-        /* .host_buffer           = */ false, // Not implemented.
+        /* .host_buffer           = */ false, // get_host_buffer_type works, but exposing it changes scheduler host-buffer placement
         /* .buffer_from_host_ptr  = */ false, // Not implemented.
-        /* .events                = */ false, // Not implemented.
+        /* .events                = */ true,  // proxied via simple devices (fan-out)
     };
     for (ggml_backend_dev_t simple_dev : meta_dev_ctx->simple_devs) {
         ggml_backend_dev_props tmp_props;
@@ -140,6 +150,45 @@ static void ggml_backend_meta_device_get_props(ggml_backend_dev_t dev, ggml_back
         props->caps.host_buffer          = props->caps.host_buffer          && tmp_props.caps.host_buffer;
         props->caps.buffer_from_host_ptr = props->caps.buffer_from_host_ptr && tmp_props.caps.buffer_from_host_ptr;
         props->caps.events               = props->caps.events               && tmp_props.caps.events;
+    }
+}
+
+struct ggml_backend_meta_event_context {
+    std::vector<ggml_backend_event_t> simple_events;
+};
+
+static ggml_backend_event_t ggml_backend_meta_device_event_new(ggml_backend_dev_t dev) {
+    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+    auto * ev_ctx = new ggml_backend_meta_event_context();
+    ev_ctx->simple_events.reserve(meta_dev_ctx->simple_devs.size());
+    for (ggml_backend_dev_t simple_dev : meta_dev_ctx->simple_devs) {
+        ggml_backend_event_t simple_ev = ggml_backend_event_new(simple_dev);
+        if (simple_ev == nullptr) {
+            for (ggml_backend_event_t e : ev_ctx->simple_events) {
+                ggml_backend_event_free(e);
+            }
+            delete ev_ctx;
+            return nullptr;
+        }
+        ev_ctx->simple_events.push_back(simple_ev);
+    }
+    return new ggml_backend_event{dev, ev_ctx};
+}
+
+static void ggml_backend_meta_device_event_free(ggml_backend_dev_t /*dev*/, ggml_backend_event_t event) {
+    auto * ev_ctx = (ggml_backend_meta_event_context *) event->context;
+    for (ggml_backend_event_t e : ev_ctx->simple_events) {
+        ggml_backend_event_free(e);
+    }
+    delete ev_ctx;
+    delete event;
+}
+
+static void ggml_backend_meta_device_event_synchronize(ggml_backend_dev_t /*dev*/, ggml_backend_event_t event) {
+    auto * ev_ctx = (ggml_backend_meta_event_context *) event->context;
+    for (ggml_backend_event_t e : ev_ctx->simple_events) {
+        ggml_backend_event_synchronize(e);
     }
 }
 
@@ -188,9 +237,9 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .supports_op          = */ ggml_backend_meta_device_supports_op,
     /* .supports_buft        = */ ggml_backend_meta_device_supports_buft,
     /* .offload_op           = */ nullptr,
-    /* .event_new            = */ nullptr,
-    /* .event_free           = */ nullptr,
-    /* .event_synchronize    = */ nullptr,
+    /* .event_new            = */ ggml_backend_meta_device_event_new,
+    /* .event_free           = */ ggml_backend_meta_device_event_free,
+    /* .event_synchronize    = */ ggml_backend_meta_device_event_synchronize,
 };
 
 static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
@@ -211,8 +260,11 @@ static ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t me
 }
 
 ggml_backend_dev_t ggml_backend_meta_device(
-        ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud) {
+        ggml_backend_dev_t * devs, size_t n_devs, size_t tps,
+        ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud) {
+    GGML_ASSERT(n_devs > 0);
     GGML_ASSERT(n_devs <= GGML_BACKEND_META_MAX_DEVICES);
+    GGML_ASSERT(tps == 0 || (tps > 0 && n_devs % tps == 0));
     // TODO: this is not thread-safe - needs to be fixed
     static std::vector<std::unique_ptr<ggml_backend_meta_device_context>>         ctxs;
     static std::map<ggml_backend_meta_device_context, struct ggml_backend_device> meta_devs;
@@ -222,7 +274,7 @@ ggml_backend_dev_t ggml_backend_meta_device(
     for (size_t i = 0; i < n_devs; i++) {
         simple_devs.push_back(devs[i]);
     }
-    ggml_backend_meta_device_context ctx(simple_devs, get_split_state, get_split_state_ud);
+    ggml_backend_meta_device_context ctx(simple_devs, tps, get_split_state, get_split_state_ud);
 
     {
         auto it = meta_devs.find(ctx);
@@ -542,6 +594,17 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return src_ss[0];
     };
 
+    // SUM_ROWS produces a partial result when the input is split on axis 0:
+    // each rank sums its slice locally, then the
+    // PARTIAL state forces an AllReduce when a downstream op needs the full value.
+    // For axis >= 1 the reduction is purely per-row and stays in the input's split.
+    auto handle_axis0_reduce = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
+        return src_ss[0];
+    };
+
     // Some ops broadcast the src1 data across src0:
     auto handle_bin_bcast = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS &&
@@ -845,7 +908,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_SUM: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
-            case GGML_OP_SUM_ROWS:
+            case GGML_OP_SUM_ROWS: {
+                split_state = handle_axis0_reduce(src_ss);
+            } break;
             case GGML_OP_CUMSUM:
             case GGML_OP_MEAN:
             case GGML_OP_ARGMAX:
@@ -1610,12 +1675,69 @@ struct ggml_backend_meta_context {
     size_t                      n_subgraphs   = 0;
     uint64_t                    uid           = 0;
 
-    void *                               comm_ctx       = nullptr;
+    // Per-subgraph metadata for multi-stage. closure indicates what to do after the
+    // subgraph runs:
+    //   NONE     = nothing (last subgraph, end of cgraph)
+    //   AR       = AllReduce within the subgraph's stage (boundary was a PARTIAL node)
+    //   TRANSFER = lane-pair broadcast from this stage to the next subgraph's stage
+    // xfer is populated only when closure == TRANSFER. It holds the MIRRORED graph nodes
+    // produced in this stage (or earlier) that are still LIVE (consumed by the new stage's
+    // compute). Just transferring the last node of the prior subgraph is insufficient. The
+    // residual stream tensor (e.g. l_out-19 in transformer) is produced in the transition
+    // subgraph's first node and consumed by the new stage's residual ADDs, separately from
+    // the last node (e.g. attn_norm-20).
+    enum class subgraph_closure : int8_t { NONE = 0, AR = 1, TRANSFER = 2 };
+    struct subgraph_meta {
+        size_t                     stage   = 0;
+        subgraph_closure           closure = subgraph_closure::NONE;
+        std::vector<ggml_tensor *> xfer;
+    };
+    std::vector<subgraph_meta> subgraphs;
+
+    // tps and n_stages cached from the meta device context. tps == n_devs and n_stages == 1
+    // for the vanilla single-stage TP case; tps < n_devs and n_stages > 1 partitions backends
+    // into n_stages contiguous blocks of tps simple_backends each, with one comm_ctx per
+    // block confining AllReduce to that block's lanes.
+    size_t                               tps      = 0;
+    size_t                               n_stages = 1;
+    std::vector<void *>                  comm_ctxs;       // size == n_stages; entry may be null if comm_init unavailable
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+    void *                               xfer_comm_ctx = nullptr;
+    ggml_backend_comm_sendrecv_tensor_t  comm_sendrecv = nullptr;
+    bool                                 xfer_comm_default = false;
+    bool                                 xfer_comm_moe_large = false;
+    size_t                               xfer_comm_moe_threshold = 1024 * 1024;
+    bool                                 graph_has_moe_ops = false;
+
+    // Optional dedicated-stream cross-backend copy. Both pointers are non-null if the
+    // simple backend exposes the queue+drain pair via proc_address. Used by stage_transfer
+    // to issue cross-stage copies on a side stream so they don't serialize behind compute
+    // on the source main stream. Each (src_lane, dst_lane) pair takes one queue call per
+    // boundary tensor and exactly one drain call after all queues. The drain host-syncs
+    // the side stream because the cross-device GPU dependency from pp_copy_stream to
+    // dst->main is not reliable on HIP under GPU_MAX_HW_QUEUES=8 (gpt-oss-120b SWA past
+    // 4K tokens emitted '?' tokens with the previous all-event shape).
+    ggml_backend_cpy_tensor_async_dedicated_queue_t cpy_async_dedicated_queue = nullptr;
+    ggml_backend_cpy_tensor_async_dedicated_drain_t cpy_async_dedicated_drain = nullptr;
+
+    // Sync-fallback scratch for set_tensor_async on layouts the chunk-by-chunk path can't handle:
+    // multi-segment splits, and PARTIAL axis (per-device 1/N scaling needs the whole tensor).
+    // Sequentially-arriving chunks accumulate here, then dispatch via the sync set_tensor path
+    // once the last byte is in.
+    struct fallback_accum {
+        const ggml_tensor *  tensor = nullptr;
+        std::vector<uint8_t> data;
+    };
+    fallback_accum accum;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
+        const bool copy_only = params != nullptr && strcmp(params, "copy-only") == 0;
+        const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
-        n_reduce_steps = std::ceil(std::log2(n_devs));
+        tps      = meta_dev_ctx->tps;
+        n_stages = meta_dev_ctx->n_stages;
+        GGML_ASSERT(tps > 0 && n_stages > 0 && tps * n_stages == n_devs);
+        n_reduce_steps = std::ceil(std::log2(tps));
         name = "Meta(";
         std::vector<ggml_backend_t> simple_backends;
         backend_configs.reserve(n_devs);
@@ -1631,27 +1753,101 @@ struct ggml_backend_meta_context {
         }
         name += ")";
 
-        if (n_devs > 1) {
-            ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(
-                ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_init");
-            if (comm_init != nullptr) {
-                comm_ctx = comm_init(simple_backends.data(), simple_backends.size());
+        // Per-stage comm_ctx: each stage covers [stage*tps, (stage+1)*tps) and runs its own
+        // AllReduce. tps == 1 stages skip comm_init (no AR needed within a single GPU).
+        ggml_backend_reg_t simple_reg = ggml_backend_dev_backend_reg(
+            ggml_backend_get_device(simple_backends[0]));
+        ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t)
+            ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_comm_init");
+
+        comm_ctxs.assign(n_stages, nullptr);
+        const bool   no_comm     = copy_only;
+        if (tps > 1 && !no_comm && comm_init != nullptr) {
+            for (size_t s = 0; s < n_stages; s++) {
+                comm_ctxs[s] = comm_init(simple_backends.data() + s * tps, tps);
             }
         }
-        if (comm_ctx != nullptr) {
-            comm_allreduce = (ggml_backend_comm_allreduce_tensor_t)
-                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
-                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
-            GGML_ASSERT(comm_allreduce != nullptr);
+        // Pull the AR func pointer once if any stage has a comm_ctx.
+        for (size_t s = 0; s < n_stages; s++) {
+            if (comm_ctxs[s] != nullptr) {
+                comm_allreduce = (ggml_backend_comm_allreduce_tensor_t)
+                    ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_comm_allreduce_tensor");
+                GGML_ASSERT(comm_allreduce != nullptr);
+                break;
+            }
+        }
+
+        // Optional RCCL/NCCL point-to-point transfer path for stage boundaries. On HIP
+        // with GPU_MAX_HW_QUEUES > 4, cross-device stream waits on ordinary HIP events
+        // are not reliable for the dedicated memcpy path. A global comm lets the backend
+        // express stage transfers as send/recv operations. The CUDA backend stages each
+        // source tensor before sending so the original compute buffer can be reused while
+        // the P2P transfer is still in flight. On ROCm, the comm path is also faster for
+        // wider stage transfers (tps >= 3); keep tps=2 on dedicated copies unless HWQ8
+        // requires the comm path.
+        const char * env_xfer_comm = getenv("GGML_META_XFER_RCCL");
+        const bool   xfer_forced   = env_xfer_comm && atoi(env_xfer_comm) != 0;
+        const bool   xfer_disabled = env_xfer_comm && atoi(env_xfer_comm) == 0;
+        auto env_u64 = [](const char * name, uint64_t default_value) {
+            const char * value = getenv(name);
+            if (value == nullptr || value[0] == '\0') {
+                return default_value;
+            }
+
+            char * end = nullptr;
+            const unsigned long long parsed = strtoull(value, &end, 10);
+            return end != value ? (uint64_t) parsed : default_value;
+        };
+
+        const char * env_hwq       = getenv("GPU_MAX_HW_QUEUES");
+        const bool   hwq_gt4       = env_hwq && atoi(env_hwq) > 4;
+        const bool   is_rocm       = strcmp(ggml_backend_reg_name(simple_reg), "ROCm") == 0;
+        const bool   rocm_prefer_xfer_comm = is_rocm && tps >= 3;
+        xfer_comm_default = xfer_forced || hwq_gt4 || rocm_prefer_xfer_comm;
+        xfer_comm_moe_large = is_rocm && tps == 2;
+        xfer_comm_moe_threshold = env_u64("GGML_META_MOE_XFER_RCCL_THRESHOLD", 1024 * 1024);
+        const bool   want_xfer_comm = n_stages > 1 && !no_comm && !xfer_disabled &&
+                                      (xfer_comm_default || xfer_comm_moe_large);
+        if (want_xfer_comm && comm_init != nullptr) {
+            comm_sendrecv = (ggml_backend_comm_sendrecv_tensor_t)
+                ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_comm_sendrecv_tensor");
+            if (comm_sendrecv != nullptr) {
+                xfer_comm_ctx = comm_init(simple_backends.data(), n_devs);
+            }
+        }
+
+        // Look up the dedicated-stream copy queue+drain pair (optional). When available,
+        // stage_transfer uses them to avoid host-blocking and main-stream serialization on
+        // cross-stage copies. Both must be present together; if the backend only exposes one
+        // (older build), fall back to the sync path.
+        if (n_stages > 1) {
+            cpy_async_dedicated_queue = (ggml_backend_cpy_tensor_async_dedicated_queue_t)
+                ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_cpy_tensor_async_dedicated_queue");
+            cpy_async_dedicated_drain = (ggml_backend_cpy_tensor_async_dedicated_drain_t)
+                ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_cpy_tensor_async_dedicated_drain");
+            if (cpy_async_dedicated_queue == nullptr || cpy_async_dedicated_drain == nullptr) {
+                cpy_async_dedicated_queue = nullptr;
+                cpy_async_dedicated_drain = nullptr;
+            }
         }
     }
 
     ~ggml_backend_meta_context() {
-        if (comm_ctx != nullptr) {
-            ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
+        ggml_backend_comm_free_t comm_free = nullptr;
+        if (xfer_comm_ctx != nullptr) {
+            comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
             GGML_ASSERT(comm_free != nullptr);
-            comm_free(comm_ctx);
+            comm_free(xfer_comm_ctx);
+        }
+        for (size_t s = 0; s < comm_ctxs.size(); s++) {
+            if (comm_ctxs[s] == nullptr) continue;
+            if (comm_free == nullptr) {
+                comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
+                    ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
+                GGML_ASSERT(comm_free != nullptr);
+            }
+            comm_free(comm_ctxs[s]);
         }
         for (auto & bc : backend_configs) {
             ggml_backend_free(bc.backend);
@@ -1674,10 +1870,41 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
 
 static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
-    GGML_ASSERT(offset == 0);
     GGML_ASSERT(ggml_is_contiguous(tensor));
 
+    if (size == 0) {
+        return;
+    }
+
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+
+    // Multi-segment, nr-broadcast, and PARTIAL cannot be dispatched chunk-by-chunk. Pass the whole
+    // tensor through if we already have it, otherwise buffer sequentially-arriving chunks until the
+    // last byte, then dispatch via the sync set_tensor path which handles those layouts.
+    if (split_state.n_segments != 1 || split_state.nr[0] != 1 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+        const size_t total = ggml_nbytes(tensor);
+        if (offset == 0 && size == total) {
+            ggml_backend_tensor_set(tensor, data, 0, size);
+            return;
+        }
+        ggml_backend_meta_context * be_ctx = (ggml_backend_meta_context *) backend->context;
+        auto & acc = be_ctx->accum;
+        if (acc.tensor != tensor) {
+            acc.tensor = tensor;
+            acc.data.assign(total, 0);
+        }
+        GGML_ASSERT(offset + size <= acc.data.size());
+        memcpy(acc.data.data() + offset, data, size);
+        if (offset + size == acc.data.size()) {
+            ggml_backend_tensor_set(tensor, acc.data.data(), 0, acc.data.size());
+            acc.tensor = nullptr;
+            std::vector<uint8_t>().swap(acc.data);
+        }
+        return;
+    }
+
+    // The fallback above intercepts every multi-segment / PARTIAL layout; whatever reaches the
+    // chunk-by-chunk dispatch below is a plain single-segment, unrepeated split.
     GGML_ASSERT(split_state.n_segments == 1);
     GGML_ASSERT(split_state.nr[0]      == 1);
 
@@ -1687,23 +1914,77 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
         case GGML_BACKEND_SPLIT_AXIS_2: {
             // Exploit that tensors are contiguous to splice it with simple tensors as "chunks".
             const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
-            GGML_ASSERT(offset % chunk_size_full == 0);
-            GGML_ASSERT(size   % chunk_size_full == 0);
-            const int64_t i_start =  offset        /chunk_size_full;
-            const int64_t i_stop  = (offset + size)/chunk_size_full;
-            size_t offset_j = 0;
-            for (size_t j = 0; j < n_backends; j++){
-                ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
-                ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1];
-                if (chunk_size_j == 0) {
-                    continue;
+
+            // Per-device dispatch for a single row's column range [col_off, col_off + len).
+            // Used for the unaligned head/tail when the chunk doesn't land on row boundaries.
+            // Zero-size device slices are skipped (upstream zero-sized-slice TP fix).
+            auto write_partial_row = [&](int64_t R, size_t col_off, size_t len, const char * src) {
+                size_t col_start_j = 0;
+                for (size_t j = 0; j < n_backends; j++) {
+                    ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                    const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1];
+                    if (chunk_size_j == 0) {
+                        continue;
+                    }
+                    const size_t col_end_j    = col_start_j + chunk_size_j;
+                    const size_t s = std::max(col_start_j, col_off);
+                    const size_t e = std::min(col_end_j,   col_off + len);
+                    if (s < e) {
+                        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+                        const size_t dst_off  = (size_t) R * chunk_size_j + (s - col_start_j);
+                        const size_t src_off  = s - col_off;
+                        const size_t copy_len = e - s;
+                        ggml_backend_tensor_set_async(simple_backend, simple_tensor, src + src_off, dst_off, copy_len);
+                    }
+                    col_start_j = col_end_j;
                 }
-                ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor, (const char *) data + offset_j, offset, chunk_size_j,
-                    i_stop - i_start, chunk_size_j, chunk_size_full);
-                offset_j += chunk_size_j;
+            };
+
+            const char * src       = (const char *) data;
+            size_t       pos       = offset;
+            size_t       remaining = size;
+
+            // Partial head: bytes from current pos up to the next row boundary, capped by remaining.
+            if ((pos % chunk_size_full) != 0) {
+                const int64_t R       = (int64_t) (pos / chunk_size_full);
+                const size_t  col_off = pos % chunk_size_full;
+                const size_t  len     = std::min(chunk_size_full - col_off, remaining);
+                write_partial_row(R, col_off, len, src);
+                src       += len;
+                pos       += len;
+                remaining -= len;
             }
-            GGML_ASSERT(offset_j == chunk_size_full);
+
+            // Aligned middle: full rows. One strided 2D async dispatch per device.
+            const int64_t i_first = (int64_t) (pos / chunk_size_full);
+            const int64_t n_rows  = (int64_t) (remaining / chunk_size_full);
+            if (n_rows > 0) {
+                size_t offset_j = 0;
+                for (size_t j = 0; j < n_backends; j++) {
+                    ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+                    ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                    const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1];
+                    if (chunk_size_j == 0) {
+                        continue;
+                    }
+                    ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor, src + offset_j,
+                        i_first * chunk_size_j, chunk_size_j,
+                        n_rows, chunk_size_j, chunk_size_full);
+                    offset_j += chunk_size_j;
+                }
+                GGML_ASSERT(offset_j == chunk_size_full);
+                const size_t consumed = (size_t) n_rows * chunk_size_full;
+                src       += consumed;
+                pos       += consumed;
+                remaining -= consumed;
+            }
+
+            // Partial tail: remaining bytes starting at column 0 of the current row.
+            if (remaining > 0) {
+                GGML_ASSERT((pos % chunk_size_full) == 0);
+                const int64_t R = (int64_t) (pos / chunk_size_full);
+                write_partial_row(R, 0, remaining, src);
+            }
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
             for (size_t j = 0; j < n_backends; j++) {
@@ -1712,7 +1993,7 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
             }
         } break;
         default: {
-            GGML_ABORT("fatal error");
+            GGML_ABORT("fatal error: meta set_tensor_async unhandled split axis %d", (int) split_state.axis);
         }
     }
 }
@@ -1752,8 +2033,9 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
             // TODO other simple backend may be better
-            ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, 0);
-            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
+            const size_t simple_backend_idx = n_backends - 1;
+            ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, simple_backend_idx);
+            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, simple_backend_idx);
             ggml_backend_tensor_get_async(simple_backend, simple_tensor, data, offset, size);
         } break;
         default: {
@@ -1812,12 +2094,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
+        backend_ctx->graph_has_moe_ops = false;
 
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_ADD_ID) {
+                    backend_ctx->graph_has_moe_ops = true;
+                }
                 if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
                     // FIXME s_copy_main is on the CPU and its view seems to be incorrectly added to the graph nodes.
                     // For regular usage this doesn't matter since it's a noop but trying to call ggml_backend_meta_buffer_simple_tensor results in a crash.
@@ -1931,7 +2217,36 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 return idr;
             };
 
+            // Determine the owning stage of a node by looking at which lanes have non-zero ne[]
+            // in its inferred split_state. -1 means "no per-lane info" (MIRRORED, PARTIAL,
+            // empty NONE), which the caller resolves by inheriting the previous active stage.
+            // TODO: ggml_backend_meta_get_split_state is recursive over src tensors and gets
+            // called once per cgraph node here plus again in the xfer_set build below. For
+            // very large graphs (gpt-oss-120b) this rebuild-time cost adds up. A memoization
+            // layer keyed on (tensor*, assume_sync) would amortize it, but the partition path
+            // only runs on cgraph shape change so this is microsecond-level on the steady
+            // state and not a priority.
+            auto node_owning_stage = [&](const ggml_tensor * node) -> int {
+                const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ true);
+                if (ss.axis < 0 || ss.axis >= GGML_MAX_DIMS) {
+                    return -1;
+                }
+                for (size_t j = 0; j < n_backends; j++) {
+                    int64_t sum = 0;
+                    for (size_t s = 0; s < ss.n_segments; s++) {
+                        sum += ss.ne[s * n_backends + j];
+                    }
+                    if (sum > 0) {
+                        return (int)(j / backend_ctx->tps);
+                    }
+                }
+                return -1;
+            };
+
+            backend_ctx->subgraphs.clear();
+
             int i_start = 0;
+            int current_stage = 0; // active stage as we walk the cgraph
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
@@ -1941,8 +2256,32 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                 }
-                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
-                if (!new_subgraph) {
+
+                // Stage detection. A node whose inferred split_state has a clear per-lane
+                // owning stage (i.e., non-zero ne[] only inside one stage's lane range)
+                // determines the active stage going forward. MIRRORED/PARTIAL inherit.
+                const int n_stage = node_owning_stage(node);
+                const bool stage_transition = (backend_ctx->n_stages > 1 && n_stage >= 0 && n_stage != current_stage && i > i_start);
+                if (stage_transition) {
+                    // Close the previous subgraph at [i_start, i-1] with TRANSFER closure so
+                    // the boundary tensor (this subgraph's last node) gets broadcast to the
+                    // new stage's lanes before we run the new stage's first node.
+                    for (size_t j = 0; j < n_backends; j++) {
+                        auto & bcj = backend_ctx->backend_configs[j];
+                        bcj.cgraphs[n_subgraphs].offset = i_start;
+                    }
+                    backend_ctx->subgraphs.push_back({ (size_t) current_stage,
+                                                       ggml_backend_meta_context::subgraph_closure::TRANSFER, {} });
+                    n_subgraphs++;
+                    i_start = i;
+                    current_stage = n_stage;
+                } else if (n_stage >= 0) {
+                    current_stage = n_stage;
+                }
+
+                const bool ar_close  = (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL);
+                const bool end_close = (i + 1 == cgraph->n_nodes);
+                if (!ar_close && !end_close) {
                     continue;
                 }
 
@@ -1969,10 +2308,62 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     auto & bcj = backend_ctx->backend_configs[j];
                     bcj.cgraphs[n_subgraphs].offset = i_start;
                 }
+                backend_ctx->subgraphs.push_back({ (size_t) current_stage,
+                                                   end_close
+                                                       ? ggml_backend_meta_context::subgraph_closure::NONE
+                                                       : ggml_backend_meta_context::subgraph_closure::AR,
+                                                   {} });
                 n_subgraphs++;
                 i_start = i + 1;
             }
             GGML_ASSERT(i_start == cgraph->n_nodes);
+
+            // Build per-transition xfer sets. A transition between sg i and sg i+1 needs to
+            // broadcast every MIRRORED graph node that was produced in sg i's stage (or any
+            // earlier stage) and is referenced by any node in sg i+1 or later. Transferring
+            // only the prior subgraph's last node is insufficient because residual-stream
+            // tensors (e.g. l_out-N) are produced earlier in the same subgraph but consumed
+            // by the next stage's residual ADDs.
+            {
+                // Map each cgraph node to its index for cheap "is this an earlier node" lookups.
+                // unordered_map / unordered_set chosen over std::map / std::set for O(1) lookups.
+                std::unordered_map<const ggml_tensor *, int> node_index;
+                node_index.reserve((size_t) cgraph->n_nodes * 2);
+                for (int ii = 0; ii < cgraph->n_nodes; ii++) {
+                    node_index[cgraph->nodes[ii]] = ii;
+                }
+                for (size_t s = 0; s < n_subgraphs; s++) {
+                    if (backend_ctx->subgraphs[s].closure != ggml_backend_meta_context::subgraph_closure::TRANSFER) {
+                        continue;
+                    }
+                    const int boundary_idx = (s + 1 < n_subgraphs)
+                        ? backend_ctx->backend_configs[0].cgraphs[s + 1].offset
+                        : cgraph->n_nodes;
+                    std::unordered_set<ggml_tensor *> seen;
+                    auto & xfer = backend_ctx->subgraphs[s].xfer;
+                    for (int k = boundary_idx; k < cgraph->n_nodes; k++) {
+                        ggml_tensor * node = cgraph->nodes[k];
+                        for (int sx = 0; sx < GGML_MAX_SRC; sx++) {
+                            ggml_tensor * src = node->src[sx];
+                            if (src == nullptr) continue;
+                            auto it = node_index.find(src);
+                            if (it == node_index.end()) continue; // not a graph node (likely a weight)
+                            if (it->second >= boundary_idx) continue; // produced in/after the new stage
+                            if (!seen.insert(src).second) continue;
+                            // Only MIRRORED tensors need cross-stage broadcast. Sharded tensors
+                            // are stage-restricted (their non-zero ne[] is on the producer's
+                            // stage's lanes only) and stage-crossing them would require
+                            // reshuffling, which the model architecture should not do.
+                            const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(src, /*assume_sync =*/ true);
+                            if (ss.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                                continue;
+                            }
+                            xfer.push_back(src);
+                        }
+                    }
+                }
+            }
+
         }
 
         backend_ctx->uid         = cgraph->uid;
@@ -2066,13 +2457,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return ret;
     };
 
-    // Preferentially use backend-specific allreduce_tensor_async (e.g. NCCL for CUDA), use a generic fallback if unavailable:
-    auto allreduce_fallback = [&](size_t i) -> ggml_status {
-        std::vector<ggml_cgraph *> step_cgraphs(n_backends, nullptr);
+    // Generic butterfly fallback. Operates within a single stage's tps lanes
+    // [lane_lo, lane_lo + lane_count). Used when the backend-native AllReduce is not
+    // available (e.g. comm_init returned null) or returned false. Indices are local k in
+    // [0, lane_count); j = lane_lo + k addresses backend_configs.
+    auto allreduce_fallback = [&](size_t i, size_t lane_lo, size_t lane_count) -> ggml_status {
+        std::vector<ggml_cgraph *> step_cgraphs(lane_count, nullptr);
 
         // Zero out nodes that were disabled due to having a zero-sized slice:
-        for (size_t j = 0; j < n_backends; j++) {
-            auto & bcj = backend_ctx->backend_configs[j];
+        for (size_t k = 0; k < lane_count; k++) {
+            auto & bcj = backend_ctx->backend_configs[lane_lo + k];
             ggml_tensor * node = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
             if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
                 continue;
@@ -2085,20 +2479,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             node_zero->buffer = node->buffer;
             node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
 
-            step_cgraphs[j] = get_cgraph_aux();
-            step_cgraphs[j]->nodes[0] = node_zero;
-            step_cgraphs[j]->n_nodes = 1;
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
+            step_cgraphs[k] = get_cgraph_aux();
+            step_cgraphs[k]->nodes[0] = node_zero;
+            step_cgraphs[k]->n_nodes = 1;
+            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[k]);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
         }
         std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
 
-        auto push_data = [&](const size_t j_src, const size_t j_dst, const size_t i_buf) {
-            assert(step_cgraphs[j_dst] == nullptr);
-            auto & bcj_src = backend_ctx->backend_configs[j_src];
-            auto & bcj_dst = backend_ctx->backend_configs[j_dst];
+        auto push_data = [&](const size_t k_src, const size_t k_dst, const size_t i_buf) {
+            assert(step_cgraphs[k_dst] == nullptr);
+            auto & bcj_src = backend_ctx->backend_configs[lane_lo + k_src];
+            auto & bcj_dst = backend_ctx->backend_configs[lane_lo + k_dst];
 
             ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
             ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
@@ -2106,7 +2500,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             GGML_ASSERT(ggml_is_contiguous(node_dst));
 
             ggml_tensor * node_tmp = get_node_aux(node_dst);
-            set_tmp_data(node_tmp, j_dst, i_buf);
+            set_tmp_data(node_tmp, lane_lo + k_dst, i_buf);
 
             ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
 
@@ -2122,21 +2516,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             ggml_cgraph * cgraph_aux = get_cgraph_aux();
             cgraph_aux->nodes[0] = node_red;
             cgraph_aux->n_nodes = 1;
-            step_cgraphs[j_dst] = cgraph_aux;
+            step_cgraphs[k_dst] = cgraph_aux;
         };
 
-        size_t offset_j = n_backends/2;
-        while ((offset_j & (offset_j - 1)) != 0) {
+        size_t offset_j = lane_count/2;
+        while (offset_j > 0 && (offset_j & (offset_j - 1)) != 0) {
             offset_j--;
         }
         const size_t offset_j_max = offset_j;
         size_t i_buf = 0;
 
-        // If n_backends is not a power of 2, fold in the excess prior to butterfly reduction:
-        for (size_t j_src = 2*offset_j_max; j_src < n_backends; j_src++) {
-            const size_t j_dst = j_src - 2*offset_j_max;
-            push_data(j_src, j_dst, i_buf);
-            const ggml_status status = ggml_backend_graph_compute_async(backend_ctx->backend_configs[j_dst].backend, step_cgraphs[j_dst]);
+        // If lane_count is not a power of 2, fold in the excess prior to butterfly reduction:
+        for (size_t k_src = 2*offset_j_max; k_src < lane_count; k_src++) {
+            const size_t k_dst = k_src - 2*offset_j_max;
+            push_data(k_src, k_dst, i_buf);
+            const ggml_status status = ggml_backend_graph_compute_async(backend_ctx->backend_configs[lane_lo + k_dst].backend, step_cgraphs[k_dst]);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
@@ -2147,20 +2541,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         for (; offset_j >= 1; offset_j /= 2) {
             std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
 
-            for (size_t j = 0; j < 2*offset_j_max; j++) {
-                const size_t j_other = j ^ offset_j;
-                if (j_other >= n_backends) {
+            for (size_t k = 0; k < 2*offset_j_max; k++) {
+                const size_t k_other = k ^ offset_j;
+                if (k_other >= lane_count) {
                     continue;
                 }
-                push_data(j, j_other, i_buf);
+                push_data(k, k_other, i_buf);
             }
 
-            for (size_t j = 0; j < 2*offset_j_max; j++) {
-                if (step_cgraphs[j] == nullptr) {
+            for (size_t k = 0; k < 2*offset_j_max; k++) {
+                if (step_cgraphs[k] == nullptr) {
                     continue;
                 }
-                auto & bcj = backend_ctx->backend_configs[j];
-                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
+                auto & bcj = backend_ctx->backend_configs[lane_lo + k];
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[k]);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
@@ -2169,10 +2563,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         assert(i_buf == backend_ctx->n_reduce_steps);
 
-        // If n_backends is not a power of 2, copy back the reduced tensors to the excess:
-        for (size_t j = 2*offset_j_max; j < n_backends; j++) {
-            auto & bcj_src = backend_ctx->backend_configs[j - 2*offset_j_max];
-            auto & bcj_dst = backend_ctx->backend_configs[j];
+        // If lane_count is not a power of 2, copy back the reduced tensors to the excess:
+        for (size_t k = 2*offset_j_max; k < lane_count; k++) {
+            auto & bcj_src = backend_ctx->backend_configs[lane_lo + (k - 2*offset_j_max)];
+            auto & bcj_dst = backend_ctx->backend_configs[lane_lo + k];
 
             ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
             ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
@@ -2182,9 +2576,121 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_SUCCESS;
     };
 
+    // Stage transition: lane-pair-wise broadcast of every MIRRORED tensor from this stage's
+    // lanes to the next stage's lanes that's in the precomputed xfer set for this transition.
+    // The xfer set was built at partition time (see backend_ctx->subgraphs[i].xfer) and
+    // covers exactly the tensors stage_b's compute reads from stage_a's outputs.
+    // MIRRORED tensors have full-size simple_tensor allocations on every lane, so the per-
+    // lane copy lands in pre-allocated memory.
+    auto stage_transfer = [&](size_t i_subgraph, size_t stage_a, size_t stage_b) -> ggml_status {
+        const size_t lane_lo_a = stage_a * backend_ctx->tps;
+        const size_t lane_lo_b = stage_b * backend_ctx->tps;
+        const auto & xfer_set  = backend_ctx->subgraphs[i_subgraph].xfer;
+        if (xfer_set.empty()) {
+            return GGML_STATUS_SUCCESS;
+        }
+
+        size_t max_xfer_nbytes = 0;
+        for (ggml_tensor * boundary : xfer_set) {
+            ggml_tensor * sj = ggml_backend_meta_buffer_simple_tensor(boundary, lane_lo_a);
+            GGML_ASSERT(sj != nullptr);
+            max_xfer_nbytes = std::max(max_xfer_nbytes, ggml_nbytes(sj));
+        }
+        const bool use_xfer_comm =
+            backend_ctx->xfer_comm_default ||
+            (backend_ctx->xfer_comm_moe_large && backend_ctx->graph_has_moe_ops &&
+             max_xfer_nbytes >= backend_ctx->xfer_comm_moe_threshold);
+
+        if (use_xfer_comm && backend_ctx->xfer_comm_ctx != nullptr && backend_ctx->comm_sendrecv != nullptr) {
+            std::vector<ggml_backend_t>         src_backends;
+            std::vector<ggml_backend_t>         dst_backends;
+            std::vector<const ggml_tensor *>    src_tensors;
+            std::vector<ggml_tensor *>          dst_tensors;
+            src_backends.reserve(xfer_set.size() * backend_ctx->tps);
+            dst_backends.reserve(xfer_set.size() * backend_ctx->tps);
+            src_tensors.reserve(xfer_set.size() * backend_ctx->tps);
+            dst_tensors.reserve(xfer_set.size() * backend_ctx->tps);
+
+            for (ggml_tensor * boundary : xfer_set) {
+                for (size_t k = 0; k < backend_ctx->tps; k++) {
+                    ggml_backend_t src_backend = backend_ctx->backend_configs[lane_lo_a + k].backend;
+                    ggml_backend_t dst_backend = backend_ctx->backend_configs[lane_lo_b + k].backend;
+                    ggml_tensor * sj = ggml_backend_meta_buffer_simple_tensor(boundary, lane_lo_a + k);
+                    ggml_tensor * dj = ggml_backend_meta_buffer_simple_tensor(boundary, lane_lo_b + k);
+                    GGML_ASSERT(sj != nullptr && dj != nullptr);
+                    GGML_ASSERT(ggml_nbytes(sj) == ggml_nbytes(dj));
+                    src_backends.push_back(src_backend);
+                    dst_backends.push_back(dst_backend);
+                    src_tensors.push_back(sj);
+                    dst_tensors.push_back(dj);
+                }
+            }
+
+            const bool ok = backend_ctx->comm_sendrecv(
+                backend_ctx->xfer_comm_ctx, src_tensors.size(),
+                src_backends.data(), dst_backends.data(), src_tensors.data(), dst_tensors.data());
+            if (ok) {
+                return GGML_STATUS_SUCCESS;
+            }
+        }
+
+        if (backend_ctx->cpy_async_dedicated_queue != nullptr) {
+            // Fallback when the RCCL sendrecv path above is unavailable (NCCL not built,
+            // GGML_META_XFER_RCCL=0, or comm_sendrecv returned false). Memcpy on a side
+            // stream so it doesn't serialize behind src compute. Two-phase: queue per
+            // (boundary, lane), then one drain per (src, dst) lane pair. The drain
+            // conditionally host-syncs pp_copy_stream under HWQ > 4 - see
+            // ggml_pp_drain_should_sync in the CUDA backend.
+            for (ggml_tensor * boundary : xfer_set) {
+                for (size_t k = 0; k < backend_ctx->tps; k++) {
+                    ggml_backend_t src_backend = backend_ctx->backend_configs[lane_lo_a + k].backend;
+                    ggml_backend_t dst_backend = backend_ctx->backend_configs[lane_lo_b + k].backend;
+                    ggml_tensor * sj = ggml_backend_meta_buffer_simple_tensor(boundary, lane_lo_a + k);
+                    ggml_tensor * dj = ggml_backend_meta_buffer_simple_tensor(boundary, lane_lo_b + k);
+                    GGML_ASSERT(sj != nullptr && dj != nullptr);
+                    GGML_ASSERT(ggml_nbytes(sj) == ggml_nbytes(dj));
+                    const bool ok = backend_ctx->cpy_async_dedicated_queue(src_backend, dst_backend, sj, dj);
+                    GGML_ASSERT(ok && "cpy_async_dedicated_queue returned false at runtime");
+                }
+            }
+            // Drain: one event_b record + one dst->main wait per (src_lane, dst_lane). The
+            // FIFO on each src's pp_copy_stream guarantees event_b fires only after every
+            // queued memcpy for that lane has completed, so dst->main resumes the next
+            // subgraph with all boundary buffers fully written.
+            for (size_t k = 0; k < backend_ctx->tps; k++) {
+                ggml_backend_t src_backend = backend_ctx->backend_configs[lane_lo_a + k].backend;
+                ggml_backend_t dst_backend = backend_ctx->backend_configs[lane_lo_b + k].backend;
+                const bool ok = backend_ctx->cpy_async_dedicated_drain(src_backend, dst_backend);
+                GGML_ASSERT(ok && "cpy_async_dedicated_drain returned false at runtime");
+            }
+            return GGML_STATUS_SUCCESS;
+        }
+
+        // Fallback: synchronous path. The buffer-iface cpy_tensor path issues the memcpy on
+        // cudaStreamPerThread (separate from the backend's main stream) and host-syncs, so
+        // it doesn't serialize subsequent compute on the backend stream. Used when the simple
+        // backend doesn't expose the dedicated queue+drain pair.
+        for (size_t k = 0; k < backend_ctx->tps; k++) {
+            ggml_backend_synchronize(backend_ctx->backend_configs[lane_lo_a + k].backend);
+        }
+        for (ggml_tensor * boundary : xfer_set) {
+            for (size_t k = 0; k < backend_ctx->tps; k++) {
+                ggml_tensor * sj = ggml_backend_meta_buffer_simple_tensor(boundary, lane_lo_a + k);
+                ggml_tensor * dj = ggml_backend_meta_buffer_simple_tensor(boundary, lane_lo_b + k);
+                GGML_ASSERT(sj != nullptr && dj != nullptr);
+                GGML_ASSERT(ggml_nbytes(sj) == ggml_nbytes(dj));
+                ggml_backend_tensor_copy(sj, dj);
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    };
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
-        for (size_t j = 0; j < n_backends; j++) {
+        const auto & sg      = backend_ctx->subgraphs[i];
+        const size_t stage   = sg.stage;
+        const size_t lane_lo = stage * backend_ctx->tps;
+        const size_t lane_hi = lane_lo + backend_ctx->tps;
+        for (size_t j = lane_lo; j < lane_hi; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
@@ -2192,28 +2698,56 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
-        if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+        if (sg.closure == ggml_backend_meta_context::subgraph_closure::AR && backend_ctx->tps > 1) {
             bool backend_allreduce_success = false;
-            if (backend_ctx->comm_ctx) {
+            if (backend_ctx->comm_ctxs[stage] != nullptr) {
                 std::vector<ggml_tensor *> nodes;
-                nodes.reserve(n_backends);
-                for (size_t j = 0; j < n_backends; j++) {
+                nodes.reserve(backend_ctx->tps);
+                for (size_t j = lane_lo; j < lane_hi; j++) {
                     auto & bcj = backend_ctx->backend_configs[j];
                     ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
-                    nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
+                    nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes - 1]);
                 }
-                backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+                backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctxs[stage], nodes.data());
             }
 
             if (!backend_allreduce_success) {
-                const ggml_status status = allreduce_fallback(i);
+                const ggml_status status = allreduce_fallback(i, lane_lo, backend_ctx->tps);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
             }
+        } else if (sg.closure == ggml_backend_meta_context::subgraph_closure::TRANSFER) {
+            GGML_ASSERT(i + 1 < backend_ctx->n_subgraphs);
+            const size_t stage_b = backend_ctx->subgraphs[i + 1].stage;
+            const ggml_status status = stage_transfer(i, stage, stage_b);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
         }
+        // closure == NONE: last subgraph, no closure action.
     }
     return GGML_STATUS_SUCCESS;
+}
+
+static void ggml_backend_meta_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    GGML_ASSERT(ggml_backend_is_meta(backend));
+    auto * ev_ctx = (ggml_backend_meta_event_context *) event->context;
+    const size_t n = ggml_backend_meta_n_backends(backend);
+    GGML_ASSERT(ev_ctx->simple_events.size() == n);
+    for (size_t j = 0; j < n; j++) {
+        ggml_backend_event_record(ev_ctx->simple_events[j], ggml_backend_meta_simple_backend(backend, j));
+    }
+}
+
+static void ggml_backend_meta_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    GGML_ASSERT(ggml_backend_is_meta(backend));
+    auto * ev_ctx = (ggml_backend_meta_event_context *) event->context;
+    const size_t n = ggml_backend_meta_n_backends(backend);
+    GGML_ASSERT(ev_ctx->simple_events.size() == n);
+    for (size_t j = 0; j < n; j++) {
+        ggml_backend_event_wait(ggml_backend_meta_simple_backend(backend, j), ev_ctx->simple_events[j]);
+    }
 }
 
 static const ggml_backend_i ggml_backend_meta_i = {
@@ -2230,8 +2764,8 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .graph_plan_update       = */ nullptr,
     /* .graph_plan_compute      = */ nullptr,
     /* .graph_compute           = */ ggml_backend_meta_graph_compute,
-    /* .event_record            = */ nullptr,
-    /* .event_wait              = */ nullptr,
+    /* .event_record            = */ ggml_backend_meta_event_record,
+    /* .event_wait              = */ ggml_backend_meta_event_wait,
     /* .graph_optimize          = */ nullptr,
 };
 
@@ -2254,6 +2788,12 @@ size_t ggml_backend_meta_n_backends(ggml_backend_t meta_backend) {
     GGML_ASSERT(ggml_backend_is_meta(meta_backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
     return backend_ctx->backend_configs.size();
+}
+
+size_t ggml_backend_meta_n_stages(ggml_backend_t meta_backend) {
+    GGML_ASSERT(ggml_backend_is_meta(meta_backend));
+    const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
+    return backend_ctx->n_stages;
 }
 
 ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index) {

@@ -507,8 +507,14 @@ struct llama_device {
     ggml_backend_dev_t dev;
 };
 
+// Userdata for llama_meta_device_get_split_state. n_devices and n_stages must
+// match the values passed to ggml_backend_meta_device (n_devs and n_devs/tps).
+// The meta device, meta backend context, and this struct all hold the same values
+// (derived from tps); they are populated together in llama.cpp's build_meta_devices
+// and never diverge at runtime.
 struct llama_meta_device_get_split_state_userdata {
-    size_t                     n_devices;
+    size_t                     n_devices; // total simple devices wrapped by the Meta device
+    size_t                     n_stages;  // pipeline-parallel stage count; 1 == single-stage TP
     const struct llama_model * model;
 };
 

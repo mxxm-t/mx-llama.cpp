@@ -1463,15 +1463,16 @@ bool llama_model_loader::load_all_data(
             return nullptr;
         }
 
+        auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
         ggml_backend_dev_props props;
         ggml_backend_dev_get_props(dev, &props);
-        if (!props.caps.async || !props.caps.host_buffer || !props.caps.events) {
+        const bool meta_host_buft = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META && host_buft != nullptr;
+        if (!props.caps.async || (!props.caps.host_buffer && !meta_host_buft) || !props.caps.events) {
             LLAMA_LOG_DEBUG("%s: device %s does not support async, host buffers or events\n", func,
                 ggml_backend_dev_name(dev));
             return nullptr;
         }
 
-        auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
         if (!host_buft) {
             LLAMA_LOG_DEBUG("%s: no host buffer type found for device %s\n", func,
                 ggml_backend_dev_name(dev));
@@ -1501,7 +1502,7 @@ bool llama_model_loader::load_all_data(
             events.emplace_back(event);
         }
 
-        ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+        ggml_backend_t backend = ggml_backend_dev_init(dev, meta_host_buft ? "copy-only" : nullptr);
         if (!backend) {
             LLAMA_LOG_DEBUG("%s: failed to initialize backend for device %s for async uploads\n", func,
                 ggml_backend_dev_name(dev));

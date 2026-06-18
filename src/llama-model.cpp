@@ -422,7 +422,18 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "ssm_out.weight");
         }
         if (std::regex_match(tensor_name, pattern_qk_norm)) {
-            return get_tensor_config_impl(tensor->ne[1] == 1 ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+            // Per-head 1D norms are reused for every head. MiniMax-M2 full-
+            // projection 1D norms cover the sharded Q/K output, so split them
+            // with the projection. Existing 2D norms stay split by head.
+            tensor_config tc = get_tensor_config_impl(
+                    tensor->ne[1] != 1 ? GGML_BACKEND_SPLIT_AXIS_1 : GGML_BACKEND_SPLIT_AXIS_MIRRORED,
+                    "attn_output.weight");
+            if (ud->model->arch == LLM_ARCH_MINIMAX_M2 &&
+                    tensor->ne[1] == 1 &&
+                    tensor->ne[0] > hparams.n_embd_head_k(tc.il)) {
+                tc.axis = GGML_BACKEND_SPLIT_AXIS_0;
+            }
+            return tc;
         }
         if (std::regex_match(tensor_name, pattern_kv_cache) || std::regex_match(tensor_name, pattern_attn_sinks)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
@@ -602,6 +613,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 GGML_ASSERT(segments.size() == 1);
                 return {granularity_kv};
             }
+            if (std::regex_match(tensor_name, pattern_qk_norm) &&
+                    ud->model->arch == LLM_ARCH_MINIMAX_M2 &&
+                    tensor->ne[1] == 1 &&
+                    tensor->ne[0] > hparams.n_embd_head_k(il)) {
+                // Match MiniMax-M2 full-projection q/k norm slices to the
+                // projection slices consumed by the following MUL.
+                GGML_ASSERT(segments.size() == 1);
+                const bool is_q = tensor_name.find(".attn_q_norm.") != std::string::npos;
+                return {is_q ? granularity_q : granularity_kv};
+            }
             if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias)) {
                 GGML_ASSERT(segments.size() == 2);
                 return {granularity_q, granularity_kv};
@@ -620,20 +641,73 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return {1};
     };
 
+    // Determine which TP stage owns this tensor. Layers map to stages contiguously
+    // (block-wise). For non-blk tensors that don't carry a layer index, the convention is:
+    //   - tok_embd / pos_embd / type_embd / conv1d / altup_proj / per_layer_* / etc.
+    //     -> stage 0 (consumed at the start)
+    //   - output* / cls* / *unembd_proj / dense_N_out_layers
+    //     -> stage n_stages-1 (consumed at the end)
+    //   - everything else -> stage 0 default (harmless in single-stage; flagged as a
+    //     warning below in multi-stage so new architectures with end-of-model tensors
+    //     surface instead of being silently misplaced)
+    // Returns the stage in [0, n_stages); for non-blk tensors with no clear owner, returns 0.
+    auto starts_with = [](const std::string & s, const char * p) {
+        const size_t n = strlen(p);
+        return s.size() >= n && s.compare(0, n, p) == 0;
+    };
+    auto owning_stage = [&](uint32_t il, bool is_blk) -> size_t {
+        if (ud->n_stages <= 1) {
+            return 0;
+        }
+        if (is_blk) {
+            const uint32_t n_layer = hparams.n_layer;
+            GGML_ASSERT(n_layer > 0);
+            // contiguous block-wise mapping: stage = il * n_stages / n_layer
+            return std::min<size_t>((size_t) il * ud->n_stages / n_layer, ud->n_stages - 1);
+        }
+        // End-of-model tensors. Prefix matching covers existing variants (output.weight,
+        // output.bias, output_norm.weight/bias, output_norm_enc.weight, cls.weight,
+        // cls_norm.weight, cls_out.weight/bias) plus future ones (output_b, output_scale,
+        // etc.) without code changes.
+        if (starts_with(tensor_name, "output") ||
+                starts_with(tensor_name, "cls") ||
+                starts_with(tensor_name, "dense_2_out_layers") ||
+                starts_with(tensor_name, "dense_3_out_layers") ||
+                starts_with(tensor_name, "altup_unembd_proj")) {
+            return ud->n_stages - 1;
+        }
+        return 0;
+    };
+
+    tensor_config tc = get_tensor_config();
+
+    // Determine the owning stage's lane range for this tensor. In single-stage TP all
+    // n_devices are owning (lo=0, hi=n_devices). In multi-stage we shard only across
+    // [lo, hi) and zero out everything else.
+    const bool   is_blk    = tensor_name.substr(0, 4) == "blk." || tensor_name.substr(0, 6) == "cache_";
+    const size_t stage     = owning_stage(tc.il, is_blk);
+    const size_t tps       = ud->n_stages > 0 ? ud->n_devices / ud->n_stages : ud->n_devices;
+    const size_t n_lanes   = ud->n_stages > 1 ? tps : ud->n_devices;
+    const size_t lane_base = ud->n_stages > 1 ? stage * tps : 0;
+
     ggml_backend_meta_split_state split_state;
     memset(&split_state, 0, sizeof(split_state));
-    tensor_config tc = get_tensor_config();
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t ne_full = tensor->ne[split_state.axis];
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
         const float * tensor_split = ud->model->tensor_split();
         std::vector<float> tensor_split_scan;
-        tensor_split_scan.reserve(ud->n_devices);
-        for (size_t j = 0; j < ud->n_devices; j++) {
-            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % ud->n_devices]);
-            if (j > 0) {
-                tensor_split_scan[j] += tensor_split_scan[j - 1];
+        tensor_split_scan.reserve(n_lanes);
+        // In multi-stage TP we shard only across this stage's lanes [lane_base, lane_base+tps).
+        // tensor_split is indexed by global device id, so look up tensor_split[lane_base + ...]
+        // rather than tensor_split[...] - otherwise every stage would use the same first-tps
+        // fractions and the user's per-device weights for the other stages would be ignored.
+        for (size_t k = 0; k < n_lanes; k++) {
+            const size_t ts_idx = (lane_base + (k + tc.rotation) % n_lanes) % ud->n_devices;
+            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[ts_idx]);
+            if (k > 0) {
+                tensor_split_scan[k] += tensor_split_scan[k - 1];
             }
         }
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
@@ -644,17 +718,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const int64_t  g_s  = granularity[is];
             GGML_ASSERT(ne_full % g_s == 0);
             int64_t low = 0;
-            size_t j = 0;
-            for (; j < ud->n_devices - 1; j++) {
+            size_t k = 0;
+            for (; k < n_lanes - 1; k++) {
                 int64_t high = tensor_split_scan.back() == 0.0f ?
-                    ne_s * (j+1)/ud->n_devices : ne_s * tensor_split_scan[j]/tensor_split_scan.back();
+                    ne_s * (k+1)/(int64_t)n_lanes : (int64_t)(ne_s * tensor_split_scan[k]/tensor_split_scan.back());
                 if (high % g_s != 0) {
                     high -= high % g_s;
                 }
-                split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = high - low;
+                const size_t j = lane_base + (k + tc.rotation) % n_lanes;
+                split_state.ne[is*ud->n_devices + j] = high - low;
                 low = high;
             }
-            split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = ne_s - low;
+            const size_t j = lane_base + (k + tc.rotation) % n_lanes;
+            split_state.ne[is*ud->n_devices + j] = ne_s - low;
             split_state.nr[is] = nr_s;
         }
         split_state.n_segments = segments.size();
@@ -662,6 +738,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         memset(split_state.ne, 0, sizeof(split_state.ne));
         split_state.nr[0] = 1;
         split_state.n_segments = 1;
+        // MIRRORED tensors carry no per-device sizes today. In multi-stage that means they
+        // are replicated to every dev, which is correct (just wasteful for small constants).
+        // The meta backend's compute partitioning derives stage ownership from non-mirrored
+        // sources, so this doesn't break correctness.
     }
     return split_state;
     GGML_UNUSED(userdata);
@@ -2159,6 +2239,7 @@ llama_model_params llama_model_default_params() {
         /*.tensor_buft_overrides       =*/ nullptr,
         /*.n_gpu_layers                =*/ -1,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
+        /*.tensor_parallel_size        =*/ 0,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

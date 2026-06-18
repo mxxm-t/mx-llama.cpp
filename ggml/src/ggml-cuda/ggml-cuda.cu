@@ -64,6 +64,7 @@
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-cuda/tp-allreduce.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -607,6 +608,20 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (pp_copy_event_a != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(pp_copy_event_a));
+    }
+    if (pp_copy_event_b != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(pp_copy_event_b));
+    }
+    if (pp_copy_stream != nullptr) {
+        CUDA_CHECK(cudaStreamDestroy(pp_copy_stream));
+    }
+#if defined(GGML_USE_HIP)
+    if (hip_set2d_scratch_ptr != nullptr) {
+        CUDA_CHECK(cudaFreeHost(hip_set2d_scratch_ptr));
+    }
+#endif
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -1169,7 +1184,91 @@ struct ggml_backend_cuda_comm_context {
     std::vector<ncclComm_t>     comms;
 #endif // GGML_USE_NCCL
 
+    // Custom PCIe-friendly AllReduce (GPU-barrier kernel, no NCCL proxy threads).
+    // Opt-in via GGML_ENABLE_CUSTOM_AR=1. Off by default; NCCL is the default path.
+    ggml_cuda_tp::CustomARContext custom_ar;
+    bool use_custom_ar = false;
+
+    struct xfer_staging_buffer {
+        void * ptr = nullptr;
+        size_t size = 0;
+    };
+
+    struct xfer_staging_slot {
+        void * ptr = nullptr;
+        size_t size = 0;
+        cudaEvent_t done = nullptr;
+    };
+    // One slot per in-flight scheduler copy. Slots advance per source rank so
+    // the required depth is independent of how many stage boundaries exist.
+    static constexpr size_t xfer_staging_nslots = GGML_SCHED_MAX_COPIES;
+    std::vector<std::vector<xfer_staging_slot>> xfer_staging;
+    std::vector<std::vector<xfer_staging_buffer>> xfer_staging_free;
+    std::vector<size_t> xfer_staging_next;
+
+    static size_t xfer_staging_alloc_size(size_t size) {
+        const size_t alignment = 1024 * 1024;
+        size = alignment * ((size + alignment - 1) / alignment);
+        size_t alloc_size = alignment;
+        while (alloc_size < size) {
+            alloc_size *= 2;
+        }
+        return alloc_size;
+    }
+
+    static void * xfer_staging_pop_free(
+        std::vector<xfer_staging_buffer> & buffers, size_t size, size_t * actual_size) {
+        size_t best      = buffers.size();
+        size_t best_diff = (size_t) -1;
+        for (size_t i = 0; i < buffers.size(); ++i) {
+            if (buffers[i].size >= size) {
+                const size_t diff = buffers[i].size - size;
+                if (diff < best_diff) {
+                    best      = i;
+                    best_diff = diff;
+                    if (diff == 0) {
+                        break;
+                    }
+                }
+            }
+        }
+        if (best == buffers.size()) {
+            return nullptr;
+        }
+        xfer_staging_buffer buffer = buffers[best];
+        buffers[best] = buffers.back();
+        buffers.pop_back();
+        *actual_size = buffer.size;
+        return buffer.ptr;
+    }
+
+    static void xfer_staging_free_buffers(std::vector<xfer_staging_buffer> & buffers) {
+        for (xfer_staging_buffer & buffer : buffers) {
+            if (buffer.ptr != nullptr) {
+                CUDA_CHECK(cudaFree(buffer.ptr));
+            }
+        }
+        buffers.clear();
+    }
+
     ~ggml_backend_cuda_comm_context() {
+        ggml_cuda_tp::tp_custom_ar_destroy(&custom_ar);
+        for (size_t i = 0; i < xfer_staging.size(); ++i) {
+            ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backends[i]->context;
+            ggml_cuda_set_device(cuda_ctx->device);
+            for (xfer_staging_slot & slot : xfer_staging[i]) {
+                if (slot.done != nullptr) {
+                    CUDA_CHECK(cudaEventSynchronize(slot.done));
+                    CUDA_CHECK(cudaEventDestroy(slot.done));
+                }
+                if (slot.ptr != nullptr) {
+                    CUDA_CHECK(cudaFree(slot.ptr));
+                }
+            }
+            if (i < xfer_staging_free.size()) {
+                xfer_staging_free_buffers(xfer_staging_free[i]);
+            }
+        }
 #ifdef GGML_USE_NCCL
         for (ncclComm_t comm : comms) {
             NCCL_CHECK(ncclCommDestroy(comm));
@@ -1178,6 +1277,91 @@ struct ggml_backend_cuda_comm_context {
         ggml_cuda_ar_pipeline_free(ar_pipeline);
     }
 };
+
+static bool ggml_backend_cuda_comm_allreduce_custom(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    if (!comm_ctx->use_custom_ar) {
+        return false;
+    }
+
+    const int64_t ne = ggml_nelements(tensors[0]);
+    // FIXME the input of llm_graph_context::build_in_out_ids can produce a tensor with 0 elements if n_outputs == 0
+    // This then causes a crash in this function
+    if (ne == 0) {
+        return true;
+    }
+
+    if (tensors[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const size_t n_backends = comm_ctx->backends.size();
+
+    for (size_t i = 0; i < n_backends; ++i) {
+        GGML_ASSERT(tensors[i] != nullptr);
+        GGML_ASSERT(ggml_nelements(tensors[i]) == ne);
+        GGML_ASSERT(tensors[i]->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguously_allocated(tensors[i]));
+    }
+
+    // Custom AR path: supported for contiguous F32 tensors. On hardware with
+    // coherent peer writes it routes small (TG-size) messages to the broadcast
+    // kernel where the GPU-barrier path wins on launch overhead. Large
+    // (PP-size) messages fall through to NCCL because the twoshot F32 kernel
+    // pushes 2x the PCIe bytes of NCCL's BF16 ring and consistently loses
+    // 5-10% PP across tested models on PCIe 3.0.
+    // If peer-write broadcast is unavailable and NCCL/RCCL is available, fall
+    // through to the backend allreduce.
+    static const bool s_have_nccl =
+#ifdef GGML_USE_NCCL
+        true;
+#else
+        false;
+#endif
+        ;
+    if (!comm_ctx->custom_ar.broadcast_ok && s_have_nccl) {
+        return false;
+    }
+    bool eligible = true;
+    if (s_have_nccl) {
+        // Small-vs-large threshold from upstream's NCCL heuristic. Below this,
+        // broadcast wins on TG by 14-30%; above this, NCCL BF16 ring is faster.
+        eligible = (n_backends <= 2 && ne < 32768) ||
+                   (n_backends == 3 && ne < 131072) ||
+                   (n_backends >= 4 && ne < 262144);
+    }
+    if (!eligible) {
+        return false;
+    }
+
+    for (size_t i = 0; i < n_backends; ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+        if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            ggml_cuda_set_device(cuda_ctx->device);
+            CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, ggml_nbytes(tensors[i]), cuda_ctx->stream()));
+        }
+    }
+
+    // Both AR kernels read through per-rank fine-grained staging (allocated
+    // inside tp_custom_ar_allreduce) and write the reduced result straight
+    // into each rank's tensor->data. There is no intermediate output buffer
+    // because the reads and writes do not alias: reads go via staging and the
+    // write is the final result for this rank. Passing input_ptrs == output_ptrs
+    // saves one D2D memcpy per rank per AR.
+    float *      input_ptrs[GGML_CUDA_MAX_DEVICES];
+    float *      output_ptrs[GGML_CUDA_MAX_DEVICES];
+    cudaStream_t streams[GGML_CUDA_MAX_DEVICES];
+    for (size_t i = 0; i < n_backends; ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+        input_ptrs[i]  = (float *) tensors[i]->data;
+        output_ptrs[i] = (float *) tensors[i]->data;
+        streams[i]     = cuda_ctx->stream();
+    }
+
+    ggml_cuda_tp::tp_custom_ar_allreduce(
+        &comm_ctx->custom_ar, input_ptrs, output_ptrs, ne, (int)n_backends, streams);
+    return true;
+}
 
 #ifdef GGML_USE_NCCL
 // AllReduce via NCCL. Reduces as FP32 for small tensors and BF16 for large
@@ -1398,6 +1582,16 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
         ret->dev_ids.push_back(static_cast<ggml_backend_cuda_context *>(backends[i]->context)->device);
     }
 
+    // Custom AR can coexist with NCCL/internal. The top-level dispatch tries it
+    // first for eligible F32 tensors when GGML_ENABLE_CUSTOM_AR=1 is set.
+    const char * env_custom_ar = getenv("GGML_ENABLE_CUSTOM_AR");
+    const bool enabled_via_env = env_custom_ar && env_custom_ar[0] != '\0' && env_custom_ar[0] != '0';
+    const bool supported_nranks = (n_backends >= 2 && n_backends <= ggml_cuda_tp::kMaxRanks);
+    if (enabled_via_env && supported_nranks) {
+        ggml_cuda_tp::tp_custom_ar_init(&ret->custom_ar, (int)n_backends, ret->dev_ids.data());
+        ret->use_custom_ar = ret->custom_ar.initialized;
+    }
+
     const char * env = getenv("GGML_CUDA_ALLREDUCE");
     if (!env) {
         // Platform default: Linux uses NCCL, otherwise (generally Windows) internal
@@ -1423,14 +1617,246 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
     return ret;
 }
 
-// Top-level dispatch -- calls the function pointer chosen by comm_init.
-// Returns false to let the meta-backend's butterfly run.
+// Top-level dispatch -- tries optional custom AR, then calls the function pointer
+// chosen by comm_init. Returns false to let the meta-backend's butterfly run.
 static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tensor ** tensors) {
     if (comm_ctx_v == nullptr) {
         return false;
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (ggml_backend_cuda_comm_allreduce_custom(comm_ctx, tensors)) {
+        return true;
+    }
     return comm_ctx->try_allreduce(comm_ctx, tensors);
+}
+
+static int ggml_backend_cuda_comm_rank(const ggml_backend_cuda_comm_context * comm_ctx, ggml_backend_t backend) {
+    for (size_t i = 0; i < comm_ctx->backends.size(); ++i) {
+        if (comm_ctx->backends[i] == backend) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
+static void ggml_backend_cuda_pp_copy_stream_init(ggml_backend_cuda_context * ctx);
+
+static bool ggml_backend_cuda_comm_sendrecv_tensor(
+        void * comm_ctx_v, size_t n_pairs,
+        ggml_backend_t * backends_src, ggml_backend_t * backends_dst,
+        const ggml_tensor ** srcs, ggml_tensor ** dsts) {
+#ifdef GGML_USE_NCCL
+    GGML_ASSERT(comm_ctx_v != nullptr);
+    ggml_backend_cuda_comm_context * comm_ctx = (ggml_backend_cuda_comm_context *) comm_ctx_v;
+    if (comm_ctx->comms.size() != comm_ctx->backends.size()) {
+        return false;
+    }
+    if (n_pairs == 0) {
+        return true;
+    }
+    if (comm_ctx->xfer_staging.empty()) {
+        comm_ctx->xfer_staging.resize(comm_ctx->backends.size());
+        comm_ctx->xfer_staging_free.resize(comm_ctx->backends.size());
+        comm_ctx->xfer_staging_next.resize(comm_ctx->backends.size());
+        for (std::vector<ggml_backend_cuda_comm_context::xfer_staging_slot> & slots : comm_ctx->xfer_staging) {
+            slots.resize(ggml_backend_cuda_comm_context::xfer_staging_nslots);
+        }
+    }
+
+    std::vector<int> src_ranks(n_pairs);
+    std::vector<int> dst_ranks(n_pairs);
+    std::vector<ggml_backend_cuda_context *> src_ctxs(n_pairs);
+    std::vector<ggml_backend_cuda_context *> dst_ctxs(n_pairs);
+
+    for (size_t i = 0; i < n_pairs; ++i) {
+        ggml_backend_t backend_src = backends_src[i];
+        ggml_backend_t backend_dst = backends_dst[i];
+        const ggml_tensor * src = srcs[i];
+        ggml_tensor * dst = dsts[i];
+
+        if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
+            return false;
+        }
+
+        ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+        ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+        if (!ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) {
+            return false;
+        }
+
+        ggml_backend_cuda_context * src_ctx = (ggml_backend_cuda_context *) backend_src->context;
+        ggml_backend_cuda_context * dst_ctx = (ggml_backend_cuda_context *) backend_dst->context;
+        ggml_backend_cuda_buffer_context * src_buf_ctx = (ggml_backend_cuda_buffer_context *) buf_src->context;
+        ggml_backend_cuda_buffer_context * dst_buf_ctx = (ggml_backend_cuda_buffer_context *) buf_dst->context;
+        if (src_ctx->device != src_buf_ctx->device || dst_ctx->device != dst_buf_ctx->device) {
+            return false;
+        }
+        if (ggml_nbytes(src) != ggml_nbytes(dst)) {
+            return false;
+        }
+
+        const int src_rank = ggml_backend_cuda_comm_rank(comm_ctx, backend_src);
+        const int dst_rank = ggml_backend_cuda_comm_rank(comm_ctx, backend_dst);
+        if (src_rank < 0 || dst_rank < 0) {
+            return false;
+        }
+
+        src_ranks[i] = src_rank;
+        dst_ranks[i] = dst_rank;
+        src_ctxs[i]  = src_ctx;
+        dst_ctxs[i]  = dst_ctx;
+    }
+
+    // Stage source tensors into a per-rank ring before ncclSend. Directly sending
+    // src->data is not safe here because the next subgraph may reuse that compute
+    // buffer before the P2P send has completed on pp_copy_stream.
+    std::vector<void *> send_ptrs(n_pairs, nullptr);
+    std::vector<size_t> staging_offsets(n_pairs, 0);
+    std::vector<size_t> staging_sizes(comm_ctx->backends.size(), 0);
+    for (size_t i = 0; i < n_pairs; ++i) {
+        const size_t nbytes = ggml_nbytes(dsts[i]);
+        if (nbytes == 0) {
+            continue;
+        }
+        staging_offsets[i] = staging_sizes[src_ranks[i]];
+        staging_sizes[src_ranks[i]] += GGML_PAD(nbytes, 256);
+    }
+
+    std::vector<size_t> staging_slots(comm_ctx->backends.size(), 0);
+    std::vector<std::pair<size_t, size_t>> new_staging_slots;
+    std::vector<int> staged_src_ranks;
+    staged_src_ranks.reserve(n_pairs);
+
+    auto cleanup_new_staging_slots = [&]() {
+        for (const auto & rank_slot : new_staging_slots) {
+            ggml_backend_cuda_comm_context::xfer_staging_slot & slot =
+                comm_ctx->xfer_staging[rank_slot.first][rank_slot.second];
+            if (slot.ptr != nullptr) {
+                ggml_cuda_set_device(((ggml_backend_cuda_context *) comm_ctx->backends[rank_slot.first]->context)->device);
+                if (cudaFree(slot.ptr) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                }
+                slot.ptr  = nullptr;
+                slot.size = 0;
+            }
+        }
+    };
+
+    for (size_t rank = 0; rank < staging_sizes.size(); ++rank) {
+        if (staging_sizes[rank] == 0) {
+            continue;
+        }
+
+        ggml_backend_cuda_context * src_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[rank]->context;
+        ggml_backend_cuda_pp_copy_stream_init(src_ctx);
+        ggml_cuda_set_device(src_ctx->device);
+
+        const size_t staging_slot = comm_ctx->xfer_staging_next[rank]++ %
+            ggml_backend_cuda_comm_context::xfer_staging_nslots;
+        staging_slots[rank] = staging_slot;
+        ggml_backend_cuda_comm_context::xfer_staging_slot & slot = comm_ctx->xfer_staging[rank][staging_slot];
+        if (slot.done == nullptr) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&slot.done, cudaEventDisableTiming));
+        } else {
+            CUDA_CHECK(cudaEventSynchronize(slot.done));
+        }
+        if (slot.size < staging_sizes[rank]) {
+            std::vector<ggml_backend_cuda_comm_context::xfer_staging_buffer> & free_buffers =
+                comm_ctx->xfer_staging_free[rank];
+
+            // Return the too-small buffer to the free list before the new alloc so the
+            // grow doesn't transiently double the staging footprint, and so the OOM
+            // recovery path below can reclaim it too if everything else fails.
+            // cudaFree is avoided here - the comm context destructor releases pooled
+            // buffers, which keeps long-prompt grow off the synchronous-free path.
+            if (slot.ptr != nullptr) {
+                free_buffers.push_back({ slot.ptr, slot.size });
+                slot.ptr  = nullptr;
+                slot.size = 0;
+            }
+
+            const size_t alloc_size = ggml_backend_cuda_comm_context::xfer_staging_alloc_size(staging_sizes[rank]);
+            size_t actual_size = 0;
+            void * ptr = ggml_backend_cuda_comm_context::xfer_staging_pop_free(
+                free_buffers, alloc_size, &actual_size);
+            if (ptr == nullptr) {
+                cudaError_t err = ggml_cuda_device_malloc(&ptr, alloc_size, src_ctx->device);
+                if (err == cudaErrorMemoryAllocation && !free_buffers.empty()) {
+                    (void)cudaGetLastError();
+                    ggml_backend_cuda_comm_context::xfer_staging_free_buffers(free_buffers);
+                    err = ggml_cuda_device_malloc(&ptr, alloc_size, src_ctx->device);
+                }
+                if (err != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    cleanup_new_staging_slots();
+                    return false;
+                }
+                actual_size = alloc_size;
+                new_staging_slots.push_back({ rank, staging_slot });
+            }
+            slot.ptr  = ptr;
+            slot.size = actual_size;
+        }
+
+        staged_src_ranks.push_back((int) rank);
+    }
+
+    for (size_t i = 0; i < n_pairs; ++i) {
+        const size_t nbytes = ggml_nbytes(dsts[i]);
+        if (nbytes == 0) {
+            continue;
+        }
+
+        ggml_backend_cuda_context * src_ctx = src_ctxs[i];
+        const size_t staging_slot = staging_slots[src_ranks[i]];
+        ggml_backend_cuda_comm_context::xfer_staging_slot & slot =
+            comm_ctx->xfer_staging[src_ranks[i]][staging_slot];
+        send_ptrs[i] = (char *) slot.ptr + staging_offsets[i];
+
+        ggml_cuda_set_device(src_ctx->device);
+        CUDA_CHECK(cudaMemcpyAsync(send_ptrs[i], srcs[i]->data, nbytes,
+                                   cudaMemcpyDeviceToDevice, src_ctx->stream()));
+    }
+
+    for (int rank : staged_src_ranks) {
+        ggml_backend_cuda_context * src_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[rank]->context;
+        ggml_cuda_set_device(src_ctx->device);
+        CUDA_CHECK(cudaEventRecord(src_ctx->pp_copy_event_a, src_ctx->stream()));
+        CUDA_CHECK(cudaStreamWaitEvent(src_ctx->pp_copy_stream, src_ctx->pp_copy_event_a, 0));
+    }
+
+    NCCL_CHECK(ncclGroupStart());
+    for (size_t i = 0; i < n_pairs; ++i) {
+        const size_t nbytes = ggml_nbytes(dsts[i]);
+        if (nbytes == 0) {
+            continue;
+        }
+        NCCL_CHECK(ncclSend(send_ptrs[i], nbytes, ncclUint8, dst_ranks[i],
+                            comm_ctx->comms[src_ranks[i]], src_ctxs[i]->pp_copy_stream));
+        NCCL_CHECK(ncclRecv(dsts[i]->data, nbytes, ncclUint8, src_ranks[i],
+                            comm_ctx->comms[dst_ranks[i]], dst_ctxs[i]->stream()));
+    }
+    NCCL_CHECK(ncclGroupEnd());
+
+    for (int rank : staged_src_ranks) {
+        ggml_backend_cuda_context * src_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[rank]->context;
+        const size_t staging_slot = staging_slots[rank];
+        ggml_backend_cuda_comm_context::xfer_staging_slot & slot =
+            comm_ctx->xfer_staging[rank][staging_slot];
+        ggml_cuda_set_device(src_ctx->device);
+        CUDA_CHECK(cudaEventRecord(slot.done, src_ctx->pp_copy_stream));
+    }
+
+    return true;
+#else
+    GGML_UNUSED(comm_ctx_v);
+    GGML_UNUSED(n_pairs);
+    GGML_UNUSED(backends_src);
+    GGML_UNUSED(backends_dst);
+    GGML_UNUSED(srcs);
+    GGML_UNUSED(dsts);
+    return false;
+#endif // GGML_USE_NCCL
 }
 
 ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type(int main_device, const float * tensor_split) {
@@ -3167,6 +3593,40 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+#if defined(GGML_USE_HIP)
+    // hipMemcpy2DAsync HtoD on ROCm requires 4-byte-aligned row pitch for the SDMA rect
+    // path. The check lives in DmaBlitManager::copyBufferRect at rocclr/device/rocm/
+    // rocblit.cpp L284-L287 (rocm-7.2.1) — when any pitch isn't a multiple of 4 the
+    // runtime sets isSubwindowRectCopy=false and falls back to a line-by-line
+    // hsa_memory_async_copy loop (one SDMA dispatch per row).
+    // Measured on gfx906 / ROCm 7.2.1: aligned-to-4 rows ~13 GB/s vs ~230 MB/s for
+    // misaligned (~60x penalty), independent of row size. mxfp4 (17 B / 32-elem block)
+    // is the practical case: rows are 4-aligned only when columns divide by 128, and
+    // gpt-oss-120b's 2880-column experts produce 1530 B rows (1530 % 4 = 2). Workaround:
+    // gather the strided source into a pinned scratch and dispatch a single 1D
+    // hipMemcpyAsync. CUDA path unchanged.
+    if ((size & 3) != 0) {
+        const size_t total = size * n_copies;
+        if (cuda_ctx->hip_set2d_scratch_cap < total) {
+            if (cuda_ctx->hip_set2d_scratch_ptr) {
+                CUDA_CHECK(cudaFreeHost(cuda_ctx->hip_set2d_scratch_ptr));
+            }
+            CUDA_CHECK(cudaMallocHost(&cuda_ctx->hip_set2d_scratch_ptr, total));
+            cuda_ctx->hip_set2d_scratch_cap = total;
+        }
+        // Wait for any prior DMA still reading the scratch before overwriting it.
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        char *       tmp = (char *) cuda_ctx->hip_set2d_scratch_ptr;
+        const char * src = (const char *) data;
+        for (size_t r = 0; r < n_copies; r++) {
+            memcpy(tmp + r * size, src + r * stride_data, size);
+        }
+        CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, tmp, total,
+                                   cudaMemcpyHostToDevice, cuda_ctx->stream()));
+        return;
+    }
+#endif
+
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -3186,11 +3646,19 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
 
-    if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
+    // Enables async copies from CPU to CUDA, instead of only CUDA-to-CUDA.
+    // Excluding this path for MUSA as a precaution; this can be revisited if enabling copy_from_host benefits MUSA.
+#if defined(GGML_USE_MUSA)
+    const bool copy_from_host = false;
+#else
+    const bool copy_from_host = ggml_backend_buffer_is_host(buf_src) && ggml_backend_dev_type(backend_src->device) == GGML_BACKEND_DEVICE_TYPE_CPU;
+#endif
+
+    if (!(copy_from_host || ggml_backend_is_cuda(backend_src)) || !ggml_backend_is_cuda(backend_dst)) {
         return false;
     }
 
-    if (!ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) {
+    if (!(copy_from_host || ggml_backend_buffer_is_cuda(buf_src)) || !ggml_backend_buffer_is_cuda(buf_dst)) {
         return false;
     }
 
@@ -3201,14 +3669,21 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     ggml_backend_cuda_buffer_context * buf_ctx_src = (ggml_backend_cuda_buffer_context *) buf_src->context;
     ggml_backend_cuda_buffer_context * buf_ctx_dst = (ggml_backend_cuda_buffer_context *) buf_dst->context;
 
-    if (cuda_ctx_src->device != buf_ctx_src->device || cuda_ctx_dst->device != buf_ctx_dst->device) {
+    if ((copy_from_host && cuda_ctx_dst->device != buf_ctx_dst->device) ||
+        !copy_from_host && (cuda_ctx_src->device != buf_ctx_src->device || cuda_ctx_dst->device != buf_ctx_dst->device)) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: backend and buffer devices do not match\n", __func__);
 #endif // NDEBUG
         return false;
     }
 
-    if (backend_src != backend_dst) {
+    if (copy_from_host) {
+#if defined(GGML_USE_HIP)
+        CUDA_CHECK(cudaMemcpy(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyHostToDevice));
+#else
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyHostToDevice, cuda_ctx_dst->stream()));
+#endif // defined(GGML_USE_HIP)
+    } else if (backend_src != backend_dst) {
         // copy on src stream
         if (cuda_ctx_src->device == cuda_ctx_dst->device) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
@@ -3234,6 +3709,119 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         // src and dst are on the same backend
         CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
     }
+    return true;
+}
+
+static void ggml_backend_cuda_pp_copy_stream_init(ggml_backend_cuda_context * ctx) {
+    if (ctx->pp_copy_stream != nullptr) {
+        return;
+    }
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaStreamCreateWithFlags(&ctx->pp_copy_stream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaEventCreateWithFlags(&ctx->pp_copy_event_a, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&ctx->pp_copy_event_b, cudaEventDisableTiming));
+}
+
+// Dedicated-stream cross-stage copy used by the meta backend's stage_transfer as a
+// fallback when ggml_backend_comm_sendrecv_tensor is not available (NCCL not built or
+// GGML_META_XFER_RCCL=0). Memcpy runs on a side stream so it doesn't serialize behind
+// src->main compute. Split into queue + drain; drain conditionally host-syncs based on
+// ggml_pp_drain_should_sync. See docs/hip-stage-transfer-event-race.md for background.
+//
+// Caller invariant: src must not be modified on src->main between this call and dst's
+// observation of the result. The meta backend satisfies this trivially since stage_transfer
+// only fires after stage_a's compute is fully submitted on src->main.
+static bool ggml_backend_cuda_cpy_tensor_async_dedicated_queue(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst,
+        const ggml_tensor * src, ggml_tensor * dst) {
+    if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
+        return false;
+    }
+    ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (!ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) {
+        return false;
+    }
+
+    ggml_backend_cuda_context * src_ctx = (ggml_backend_cuda_context *) backend_src->context;
+    ggml_backend_cuda_context * dst_ctx = (ggml_backend_cuda_context *) backend_dst->context;
+
+    ggml_backend_cuda_buffer_context * src_buf_ctx = (ggml_backend_cuda_buffer_context *) buf_src->context;
+    ggml_backend_cuda_buffer_context * dst_buf_ctx = (ggml_backend_cuda_buffer_context *) buf_dst->context;
+    if (src_ctx->device != src_buf_ctx->device || dst_ctx->device != dst_buf_ctx->device) {
+        return false;
+    }
+
+    // Lazy-init the dedicated stream and reusable events on the src ctx.
+    ggml_backend_cuda_pp_copy_stream_init(src_ctx);
+
+    ggml_cuda_set_device(src_ctx->device);
+
+    // Wait for src's main stream to drain its current tail before issuing the memcpy.
+    // Re-recording event_a across queue calls within one stage_transfer is safe because
+    // src->main is idle during stage_transfer (sg_a's compute was submitted before the
+    // first queue call and queue calls add no work to src->main), so each record places
+    // event_a at the same end-of-queue position.
+    CUDA_CHECK(cudaEventRecord(src_ctx->pp_copy_event_a, src_ctx->stream()));
+    CUDA_CHECK(cudaStreamWaitEvent(src_ctx->pp_copy_stream, src_ctx->pp_copy_event_a, 0));
+
+    if (backend_src != backend_dst) {
+        if (src_ctx->device == dst_ctx->device) {
+            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst),
+                                       cudaMemcpyDeviceToDevice, src_ctx->pp_copy_stream));
+        } else {
+#ifdef GGML_CUDA_NO_PEER_COPY
+            return false;
+#else
+            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_ctx->device, src->data, src_ctx->device,
+                                           ggml_nbytes(dst), src_ctx->pp_copy_stream));
+#endif
+        }
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst),
+                                   cudaMemcpyDeviceToDevice, src_ctx->pp_copy_stream));
+    }
+
+    return true;
+}
+
+// Drain decision for the dedicated-cpy fallback path. Under HIP+ROCm with
+// GPU_MAX_HW_QUEUES > 4, cudaEventRecord on a side stream after hipMemcpyPeerAsync
+// does not reliably capture the SDMA completion signal, so dst->main can pass the
+// event wait while peer-copy writes are still in flight. cudaStreamSynchronize on
+// pp_copy_stream observes the signal via gpu().Barriers().WaitOnSignal and fixes
+// the race at the cost of host-blocking the dispatch loop. We pay it only under
+// HWQ > 4. The primary RCCL stage_transfer path bypasses all of this; this gate
+// only matters when that path is unavailable. See
+// docs/hip-stage-transfer-event-race.md for full background.
+static bool ggml_pp_drain_should_sync() {
+    static const int s_hwq_sync = []{
+        const char * v = getenv("GPU_MAX_HW_QUEUES");
+        return (v && atoi(v) > 4) ? 1 : 0;
+    }();
+    return s_hwq_sync != 0;
+}
+
+// Drain pp_copy_stream and queue a wait on dst->main. Called exactly once per
+// (src_backend, dst_backend) pair after all queue calls. See ggml_pp_drain_should_sync
+// for the HWQ-conditional host-sync rationale.
+static bool ggml_backend_cuda_cpy_tensor_async_dedicated_drain(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst) {
+    if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
+        return false;
+    }
+    ggml_backend_cuda_context * src_ctx = (ggml_backend_cuda_context *) backend_src->context;
+    ggml_backend_cuda_context * dst_ctx = (ggml_backend_cuda_context *) backend_dst->context;
+    if (src_ctx->pp_copy_stream == nullptr) {
+        // No queue call on this src ctx, nothing to drain.
+        return true;
+    }
+    ggml_cuda_set_device(src_ctx->device);
+    if (ggml_pp_drain_should_sync()) {
+        CUDA_CHECK(cudaStreamSynchronize(src_ctx->pp_copy_stream));
+    }
+    CUDA_CHECK(cudaEventRecord(src_ctx->pp_copy_event_b, src_ctx->pp_copy_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(dst_ctx->stream(), src_ctx->pp_copy_event_b, 0));
     return true;
 }
 
@@ -4869,6 +5457,8 @@ void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
 
 // backend device
 
+static ggml_backend_t ggml_backend_cuda_init_impl(int device, bool copy_only);
+
 struct ggml_backend_cuda_device_context {
     int device;
     std::string name;
@@ -5029,9 +5619,9 @@ static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_back
 }
 
 static ggml_backend_t ggml_backend_cuda_device_init_backend(ggml_backend_dev_t dev, const char * params) {
-    GGML_UNUSED(params);
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
-    return ggml_backend_cuda_init(ctx->device);
+    const bool copy_only = params != nullptr && strcmp(params, "copy-only") == 0;
+    return ggml_backend_cuda_init_impl(ctx->device, copy_only);
 }
 
 static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_backend_dev_t dev) {
@@ -5601,6 +6191,17 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
     }
+#ifdef GGML_USE_NCCL
+    if (strcmp(name, "ggml_backend_comm_sendrecv_tensor") == 0) {
+        return (void *)ggml_backend_cuda_comm_sendrecv_tensor;
+    }
+#endif // GGML_USE_NCCL
+    if (strcmp(name, "ggml_backend_cpy_tensor_async_dedicated_queue") == 0) {
+        return (void *)ggml_backend_cuda_cpy_tensor_async_dedicated_queue;
+    }
+    if (strcmp(name, "ggml_backend_cpy_tensor_async_dedicated_drain") == 0) {
+        return (void *)ggml_backend_cuda_cpy_tensor_async_dedicated_drain;
+    }
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *)ggml_backend_cuda_split_buffer_type;
     }
@@ -5673,13 +6274,13 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
     return &reg;
 }
 
-ggml_backend_t ggml_backend_cuda_init(int device) {
+static ggml_backend_t ggml_backend_cuda_init_impl(int device, bool copy_only) {
     if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
         GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
         return nullptr;
     }
 
-    ggml_backend_cuda_context * ctx = new ggml_backend_cuda_context(device);
+    ggml_backend_cuda_context * ctx = new ggml_backend_cuda_context(device, copy_only);
     if (ctx == nullptr) {
         GGML_LOG_ERROR("%s: failed to allocate context\n", __func__);
         return nullptr;
@@ -5693,6 +6294,10 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
     };
 
     return cuda_backend;
+}
+
+ggml_backend_t ggml_backend_cuda_init(int device) {
+    return ggml_backend_cuda_init_impl(device, false);
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)

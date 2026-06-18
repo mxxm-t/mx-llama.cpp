@@ -1,5 +1,22 @@
 #include "models.h"
 
+// Decomposed RMSNorm for MiniMax-M2 tensor split. The sum_rows partial state
+// lets the meta backend insert the allreduce needed for projection-sharded Q/K.
+static ggml_tensor * build_minimax_rms_norm_full(
+        ggml_context * ctx0,
+        ggml_tensor  * x,
+        ggml_tensor  * weight,
+        int64_t        full_dim,
+        float          eps) {
+    ggml_tensor * sumsq = ggml_sum_rows(ctx0, ggml_sqr(ctx0, x));
+    ggml_tensor * rms   = ggml_sqrt(ctx0, ggml_scale_bias(ctx0, sumsq, 1.0f / (float) full_dim, eps));
+    ggml_tensor * out   = ggml_div(ctx0, x, rms);
+    if (weight) {
+        out = ggml_mul(ctx0, out, weight);
+    }
+    return out;
+}
+
 void llama_model_minimax_m2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,  hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,   hparams.n_ff_exp);
@@ -46,6 +63,7 @@ std::unique_ptr<llm_graph_context> llama_model_minimax_m2::build_arch_graph(cons
 
 llama_model_minimax_m2::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
+    const bool is_tensor_split = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR;
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
     // GGML_ASSERT(n_embd_head == n_rot); this is wrong in case of minimax, head_dim = 128, n_rot = 64
@@ -79,12 +97,20 @@ llama_model_minimax_m2::graph::graph(const llama_model & model, const llm_graph_
             ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur);
             cb(Vcur, "Vcur", il);
 
-            Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL,
-                    LLM_NORM_RMS, il);
+            if (is_tensor_split) {
+                Qcur = build_minimax_rms_norm_full(ctx0, Qcur, model.layers[il].attn_q_norm,
+                        n_embd_head * n_head, hparams.f_norm_rms_eps);
+            } else {
+                Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
+            }
             cb(Qcur, "Qcur_normed", il);
 
-            Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, NULL,
-                    LLM_NORM_RMS, il);
+            if (is_tensor_split) {
+                Kcur = build_minimax_rms_norm_full(ctx0, Kcur, model.layers[il].attn_k_norm,
+                        hparams.n_embd_k_gqa(il), hparams.f_norm_rms_eps);
+            } else {
+                Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
+            }
             cb(Kcur, "Kcur_normed", il);
 
             Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);

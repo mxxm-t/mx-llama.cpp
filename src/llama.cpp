@@ -123,6 +123,28 @@ int64_t llama_time_us(void) {
 
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
+    // Validate -tps / tensor_parallel_size against the device count. Returns the resolved tps
+    // (0 / equal-to-n_devs both mean "single TP group covering all devs"); negative on error.
+    auto resolve_tps = [&](size_t n_devs) -> int64_t {
+        const int32_t tps_param = params.tensor_parallel_size;
+        if (tps_param <= 0) {
+            return (int64_t) n_devs;
+        }
+        if ((size_t) tps_param > n_devs || n_devs % (size_t) tps_param != 0) {
+            std::string divisors;
+            for (size_t d = 1; d <= n_devs; d++) {
+                if (n_devs % d == 0) {
+                    if (!divisors.empty()) divisors += ",";
+                    divisors += std::to_string(d);
+                }
+            }
+            LLAMA_LOG_ERROR("%s: --tensor-parallel-size %d does not divide %zu GPUs (valid: %s)\n",
+                    __func__, (int) tps_param, n_devs, divisors.c_str());
+            return -1;
+        }
+        return (int64_t) tps_param;
+    };
+
     // create list of devices to use with this model
     if (params.devices) {
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
@@ -134,15 +156,22 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
                 return false;
             }
-            LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, n_devs);
+            const int64_t tps = resolve_tps(n_devs);
+            if (tps < 0) {
+                return false;
+            }
+            const size_t n_stages = n_devs / (size_t) tps;
+            LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices (tps=%zu, n_stages=%zu)\n",
+                    __func__, n_devs, (size_t) tps, n_stages);
             for (size_t i = 0; i < n_devs; ++i) {
                 LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
             }
             model->get_split_state_ud.n_devices = n_devs;
-            model->get_split_state_ud.model = model;
+            model->get_split_state_ud.n_stages  = n_stages;
+            model->get_split_state_ud.model     = model;
             model->devices.push_back({
                 true, ggml_backend_meta_device(
-                params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
+                params.devices, n_devs, (size_t) tps, llama_meta_device_get_split_state, &model->get_split_state_ud)
             });
         } else {
             for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
@@ -173,17 +202,24 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 return false;
             }
 
-            LLAMA_LOG_INFO("%s: creating a Meta device for tensor parallelism from %zu devices:\n", __func__, devs.size());
+            const int64_t tps = resolve_tps(devs.size());
+            if (tps < 0) {
+                return false;
+            }
+            const size_t n_stages = devs.size() / (size_t) tps;
+            LLAMA_LOG_INFO("%s: creating a Meta device for tensor parallelism from %zu devices (tps=%zu, n_stages=%zu):\n",
+                    __func__, devs.size(), (size_t) tps, n_stages);
             for (size_t i = 0; i < devs.size(); ++i) {
                 LLAMA_LOG_INFO("%s: - device %zu: %s (%s)\n", __func__, i, ggml_backend_dev_name(devs[i]), ggml_backend_dev_description(devs[i]));
             }
 
             GGML_ASSERT(!devs.empty());
             model->get_split_state_ud.n_devices = devs.size();
+            model->get_split_state_ud.n_stages  = n_stages;
             model->get_split_state_ud.model     = model;
             gpus.push_back({
                 true, ggml_backend_meta_device(
-                devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)
+                devs.data(), devs.size(), (size_t) tps, llama_meta_device_get_split_state, &model->get_split_state_ud)
             });
         } else {
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {

@@ -181,15 +181,15 @@ static void launch_gated_delta_net(
         int64_t neqk1, int64_t rq3,
         float scale, int K, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
-    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-    const int num_warps = 4;
+    const int device = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const int cc = ggml_cuda_info().devices[device].cc;
+    const int num_warps = cc == GGML_CUDA_CC_VEGA20 && n_tokens == 1 ? 2 : 4;
     dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
-
-    int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
     switch (S_v) {

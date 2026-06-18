@@ -269,7 +269,8 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                  const topk_moe_config       config) {
     GGML_ASSERT(!(config.with_norm && config.delayed_softmax) &&
                 "delayed softmax is not supported with weight normalization");
-    const int    rows_per_block = 4;
+    const int    cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int    rows_per_block = cc == GGML_CUDA_CC_VEGA20 && n_rows == 1 ? 1 : 4;
     dim3         grid_dims((n_rows + rows_per_block - 1) / rows_per_block, 1, 1);
     dim3         block_dims(WARP_SIZE, rows_per_block, 1);
     cudaStream_t stream = ctx.stream();

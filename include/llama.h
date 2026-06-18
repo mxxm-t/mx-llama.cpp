@@ -298,6 +298,10 @@ extern "C" {
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
 
+        // when split_mode == LLAMA_SPLIT_MODE_TENSOR, GPUs per TP group. Remaining GPUs form pipeline stages.
+        // 0 (default): all GPUs in one TP group (original behavior). Must divide the device count.
+        int32_t tensor_parallel_size;
+
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 

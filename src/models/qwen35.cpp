@@ -538,7 +538,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     res->add_input(std::move(inp));
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = n_outputs > 0 && n_outputs < n_tokens ? build_inp_out_ids() : nullptr;
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -558,6 +558,32 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
+
+    // Phase 2b: KV-only prefill replay. The deferred replay builds the head's prompt K/V so the
+    // head can attend over the prompt when drafting; its attention/FFN/logits output is discarded
+    // (process_decode reads the TRUNK hidden, batch logits=0). So when LLAMA_MTP_PREFILL_KV_ONLY is
+    // armed, build + store ONLY K/V (identical to the full path) and skip Q/attention/gate/wo/FFN/
+    // output - removing the O(n^2) attention and the FFN that dominate the replay cost.
+    if (cparams.mtp_prefill_kv_only) {
+        ggml_tensor * Kc = build_lora_mm(layer.wk, cur, layer.wk_s);
+        Kc = ggml_reshape_3d(ctx0, Kc, n_embd_head, n_head_kv, n_tokens);
+        Kc = build_norm(Kc, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+
+        ggml_tensor * Vc = build_lora_mm(layer.wv, cur, layer.wv_s);
+        Vc = ggml_reshape_3d(ctx0, Vc, n_embd_head, n_head_kv, n_tokens);
+
+        Kc = ggml_rope_multi(ctx0, Kc, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+
+        build_attn_store_kv(inp_attn, Kc, Vc, il);
+
+        // Minimal valid result: a cheap non-null pre-norm slot (not consumed during the replay),
+        // no logits (n_outputs == 0, and the logits consumers are null-guarded).
+        res->t_h_pre_norm = inpSA;
+        ggml_build_forward_expand(gf, inpSA);
+        return;
+    }
 
     ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
     cb(Qcur_full, "mtp_Qcur_full", il);
@@ -629,21 +655,25 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cb(cur, "h_pre_norm", -1);
     res->t_h_pre_norm = cur;
 
-    cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
+    if (n_outputs > 0) {
+        if (inp_out_ids) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
 
-    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
-            ? layer.nextn.shared_head_norm
-            : model.output_norm;
-    GGML_ASSERT(head_norm_w && "QWEN35 MTP: missing both nextn.shared_head_norm and output_norm");
-    cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
-    cb(cur, "mtp_shared_head_norm", -1);
+        ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
+                ? layer.nextn.shared_head_norm
+                : model.output_norm;
+        GGML_ASSERT(head_norm_w && "QWEN35 MTP: missing both nextn.shared_head_norm and output_norm");
+        cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+        cb(cur, "mtp_shared_head_norm", -1);
 
-    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
-    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
-    GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
-    cb(cur, "result_output", -1);
+        ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+        ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+        GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
+        cur = build_lora_mm(head_w, cur, head_s);
+        cb(cur, "result_output", -1);
 
-    res->t_logits = cur;
+        res->t_logits = cur;
+    }
     ggml_build_forward_expand(gf, cur);
 }
