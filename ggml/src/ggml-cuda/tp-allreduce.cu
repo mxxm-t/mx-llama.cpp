@@ -16,7 +16,53 @@ namespace ggml_cuda_tp {
 // Signal buffers are in fine-grained/uncached memory so cross-device writes
 // are immediately visible without explicit cache flushes.
 
-#if !defined(GGML_USE_HIP)
+#if defined(GGML_USE_MUSA)
+// ---- MUSA path (compile-only) ----
+// This fork does not target MUSA, and the custom AllReduce is never enabled on
+// MUSA at run time (the coherence gate is AMD/NVIDIA only). These device helpers
+// exist solely so ggml-musa compiles. MUSA cannot parse the PTX inline asm the
+// NVIDIA path uses, so we fall back to portable system-scope fences.
+
+static __device__ __forceinline__ void st_flag_volatile(FlagType * flag_addr, FlagType flag) {
+    __threadfence_system();
+    *reinterpret_cast<volatile FlagType *>(flag_addr) = flag;
+}
+
+static __device__ __forceinline__ FlagType ld_flag_volatile(FlagType * flag_addr) {
+    FlagType flag = *reinterpret_cast<volatile FlagType *>(flag_addr);
+    __threadfence_system();
+    return flag;
+}
+
+template <int NRANKS>
+static __device__ __forceinline__ void barrier_start(
+        const RankSignals & sg, Signal * self_sg, int rank) {
+    uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
+    if (threadIdx.x < NRANKS) {
+        st_flag_volatile(&sg.signals[threadIdx.x]->start[blockIdx.x][rank], flag);
+        while (ld_flag_volatile(&self_sg->start[blockIdx.x][threadIdx.x]) != flag)
+            ;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
+}
+
+template <int NRANKS>
+static __device__ __forceinline__ void barrier_end(
+        const RankSignals & sg, Signal * self_sg, int rank) {
+    __syncthreads();
+    uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
+    if (threadIdx.x < NRANKS) {
+        *reinterpret_cast<volatile FlagType *>(&sg.signals[threadIdx.x]->end[blockIdx.x][rank]) = flag;
+        FlagType val;
+        do {
+            val = *reinterpret_cast<volatile FlagType *>(&self_sg->end[blockIdx.x][threadIdx.x]);
+        } while (val != flag);
+    }
+    if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
+}
+
+#elif !defined(GGML_USE_HIP)
 // ---- NVIDIA CUDA path ----
 
 static __device__ __forceinline__ void st_flag_volatile(FlagType * flag_addr, FlagType flag) {
