@@ -87,12 +87,12 @@ static __device__ __forceinline__ void barrier_start(
         const RankSignals & sg, Signal * self_sg, int rank) {
     uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
     if (threadIdx.x < NRANKS) {
-        __scoped_atomic_store_n(
+        __hip_atomic_store(
             &sg.signals[threadIdx.x]->start[blockIdx.x][rank],
-            flag, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
-        while (__scoped_atomic_load_n(
+            flag, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        while (__hip_atomic_load(
                    &self_sg->start[blockIdx.x][threadIdx.x],
-                   __ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM) < flag)
+                   __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < flag)
             ;
     }
     __syncthreads();
@@ -105,12 +105,12 @@ static __device__ __forceinline__ void barrier_end(
     __syncthreads();
     uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
     if (threadIdx.x < NRANKS) {
-        __scoped_atomic_store_n(
+        __hip_atomic_store(
             &sg.signals[threadIdx.x]->end[blockIdx.x][rank],
-            flag, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
-        while (__scoped_atomic_load_n(
+            flag, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        while (__hip_atomic_load(
                    &self_sg->end[blockIdx.x][threadIdx.x],
-                   __ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM) < flag)
+                   __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < flag)
             ;
     }
     if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
@@ -254,7 +254,7 @@ k_broadcast_reduce(
 #pragma unroll
         for (int r = 0; r < NRANKS; r++) {
             if (r == rank) continue;   // self-slot is NOT peer-written; read `input` directly in phase 2
-            float * dst = ((float *)dp.ptrs[r]) + rank_offset + idx * 4;
+            float * dst = ((float *)(uintptr_t)dp.ptrs[r]) + rank_offset + idx * 4;
             *((float4 *) dst) = v;     // peer write (bypasses source + dest L2 via PCIe)
         }
     }
@@ -266,7 +266,7 @@ k_broadcast_reduce(
 #pragma unroll
         for (int r = 0; r < NRANKS; r++) {
             if (r == rank) continue;
-            ((float *)dp.ptrs[r])[rank_offset + idx] = v;
+            ((float *)(uintptr_t)dp.ptrs[r])[rank_offset + idx] = v;
         }
     }
 
@@ -399,8 +399,8 @@ k_twoshot_f32(
     // Staging pointers — each rank's staging holds scatter_buf then allgather_buf.
     // rank r's scatter_buf base   = dp.ptrs[r]              (float*)
     // rank r's allgather_buf base = dp.ptrs[r] + n_elements (float* stride of n_elements floats)
-    auto scat_ptr = [&](int r) -> float * { return (float *) dp.ptrs[r]; };
-    auto ag_ptr   = [&](int r) -> float * { return ((float *) dp.ptrs[r]) + n_elements; };
+    auto scat_ptr = [&](int r) -> float * { return (float *)(uintptr_t) dp.ptrs[r]; };
+    auto ag_ptr   = [&](int r) -> float * { return ((float *)(uintptr_t) dp.ptrs[r]) + n_elements; };
 
     // ------------------------------------------------------------------------
     // Stage 1 (peer-write scatter): for each non-self target peer, all threads
