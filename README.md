@@ -5,8 +5,8 @@
 > is the multi-GPU hardware it is developed and tested on.
 >
 > See **[FEATURES.md](FEATURES.md)** for what it adds and the recommended runtime
-> environment. Prebuilt AMD / ROCm images (all CDNA + RDNA archs, plus a
-> gfx906-only build) are on Docker Hub:
+> environment. Prebuilt **AMD / ROCm** (all CDNA + RDNA archs, plus a gfx906-only
+> build) and **NVIDIA / CUDA** images are on Docker Hub:
 > **[mxxm/mx-llama.cpp](https://hub.docker.com/r/mxxm/mx-llama.cpp)**.
 
 ---
