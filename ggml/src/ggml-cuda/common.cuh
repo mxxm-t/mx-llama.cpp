@@ -430,9 +430,126 @@ struct ggml_cuda_unroll<1> {
     }
 };
 
+#if defined(GGML_USE_HIP) && defined(GCN)
+// GCN (Vega) DPP-based warp reductions.
+//
+// On GCN, __shfl_xor lowers to ds_bpermute_b32 — an LDS roundtrip plus
+// s_waitcnt per step. The same lane exchange is available for offsets
+// <= 16 as single DPP VALU ops (quad_perm / masked row shifts /
+// row_ror) or one ds_swizzle, with v_add/v_max fused into the exchange
+// for the float reductions. A full wave64 float sum becomes 5
+// DPP/swizzle ops + 1 shfl instead of 6 LDS roundtrips.
+//
+// The s_nop prefixes are mandatory VALU->DPP hazard wait states — the
+// compiler inserts these for DPP it emits itself but cannot see data
+// dependencies through asm block boundaries.
+//
+// CDNA supports the same encodings but is left on the generic path
+// (untested here); RDNA dropped several of these row ops entirely.
+
+#define GGML_GCN_DPP_F32(name, barrier, dpp_ctrl, vop_instr)                \
+    static __device__ __forceinline__ float name(const float x) {           \
+        float r;                                                            \
+        asm volatile(                                                       \
+            barrier                                                         \
+            vop_instr " %0, %1, %1 " dpp_ctrl " row_mask:0xf bank_mask:0xf" \
+            : "=v"(r) : "v"(x) : "memory");                                 \
+        return r;                                                           \
+    }
+
+GGML_GCN_DPP_F32(ggml_gcn_add_xor1_f32, "s_nop 4\n", "quad_perm:[1,0,3,2]", "v_add_f32_dpp")
+GGML_GCN_DPP_F32(ggml_gcn_add_xor2_f32, "s_nop 1\n", "quad_perm:[2,3,0,1]", "v_add_f32_dpp")
+GGML_GCN_DPP_F32(ggml_gcn_add_xor8_f32, "s_nop 1\n", "row_ror:8",           "v_add_f32_dpp")
+GGML_GCN_DPP_F32(ggml_gcn_max_xor1_f32, "s_nop 4\n", "quad_perm:[1,0,3,2]", "v_max_f32_dpp")
+GGML_GCN_DPP_F32(ggml_gcn_max_xor2_f32, "s_nop 1\n", "quad_perm:[2,3,0,1]", "v_max_f32_dpp")
+GGML_GCN_DPP_F32(ggml_gcn_max_xor8_f32, "s_nop 1\n", "row_ror:8",           "v_max_f32_dpp")
+
+#undef GGML_GCN_DPP_F32
+
+// Pure xor-lane transfer of a 32-bit payload, for reductions without a
+// DPP-fusable VOP2 (int sums, xor4/xor16 steps). off in {1,2,4,8,16}.
+template <int off>
+static __device__ __forceinline__ int ggml_gcn_xfer_xor_i32(const int x) {
+    int d;
+    if constexpr (off == 1) {
+        asm volatile("s_nop 4\n"
+                     "v_mov_b32_dpp %0, %1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"
+                     : "=v"(d) : "v"(x) : "memory");
+    } else if constexpr (off == 2) {
+        asm volatile("s_nop 4\n"
+                     "v_mov_b32_dpp %0, %1 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf"
+                     : "=v"(d) : "v"(x) : "memory");
+    } else if constexpr (off == 4) {
+        // No single-op swap-of-4 on Vega: two masked row shifts.
+        asm volatile("v_mov_b32 %0, %1\n"
+                     "s_nop 1\n"
+                     "v_mov_b32_dpp %0, %1 row_shl:4 row_mask:0xf bank_mask:0x5\n"
+                     "v_mov_b32_dpp %0, %1 row_shr:4 row_mask:0xf bank_mask:0xa\n"
+                     : "=v"(d) : "v"(x) : "memory");
+    } else if constexpr (off == 8) {
+        asm volatile("s_nop 4\n"
+                     "v_mov_b32_dpp %0, %1 row_ror:8 row_mask:0xf bank_mask:0xf"
+                     : "=v"(d) : "v"(x) : "memory");
+    } else {
+        static_assert(off == 16, "unsupported xor offset");
+        // ds_swizzle is a single in-place permutation (no LDS storage),
+        // cheaper than the bpermute lowering of __shfl_xor.
+        asm volatile("ds_swizzle_b32 %0, %1 offset:swizzle(SWAP,16)\n"
+                     "s_waitcnt lgkmcnt(0)\n"
+                     : "=v"(d) : "v"(x) : "memory");
+    }
+    return d;
+}
+
+static __device__ __forceinline__ float ggml_gcn_xfer_xor4_f32(const float x) {
+    return __int_as_float(ggml_gcn_xfer_xor_i32<4>(__float_as_int(x)));
+}
+static __device__ __forceinline__ float ggml_gcn_xfer_xor16_f32(const float x) {
+    return __int_as_float(ggml_gcn_xfer_xor_i32<16>(__float_as_int(x)));
+}
+
+template <int width>
+static __device__ __forceinline__ float ggml_gcn_warp_reduce_sum_f32(float x) {
+    static_assert(width >= 1 && (width & (width - 1)) == 0, "width must be a power of 2");
+    if constexpr (width >=  2) { x = ggml_gcn_add_xor1_f32(x); }
+    if constexpr (width >=  4) { x = ggml_gcn_add_xor2_f32(x); }
+    if constexpr (width >=  8) { x += ggml_gcn_xfer_xor4_f32(x); }
+    if constexpr (width >= 16) { x = ggml_gcn_add_xor8_f32(x); }
+    if constexpr (width >= 32) { x += ggml_gcn_xfer_xor16_f32(x); }
+    if constexpr (width >= 64) { x += __shfl_xor_sync(0xffffffff, x, 32, 64); }
+    return x;
+}
+
+template <int width>
+static __device__ __forceinline__ float ggml_gcn_warp_reduce_max_f32(float x) {
+    static_assert(width >= 1 && (width & (width - 1)) == 0, "width must be a power of 2");
+    if constexpr (width >=  2) { x = ggml_gcn_max_xor1_f32(x); }
+    if constexpr (width >=  4) { x = ggml_gcn_max_xor2_f32(x); }
+    if constexpr (width >=  8) { x = fmaxf(x, ggml_gcn_xfer_xor4_f32(x)); }
+    if constexpr (width >= 16) { x = ggml_gcn_max_xor8_f32(x); }
+    if constexpr (width >= 32) { x = fmaxf(x, ggml_gcn_xfer_xor16_f32(x)); }
+    if constexpr (width >= 64) { x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, 32, 64)); }
+    return x;
+}
+
+template <int width>
+static __device__ __forceinline__ int ggml_gcn_warp_reduce_sum_i32(int x) {
+    static_assert(width >= 1 && (width & (width - 1)) == 0, "width must be a power of 2");
+    if constexpr (width >=  2) { x += ggml_gcn_xfer_xor_i32<1>(x); }
+    if constexpr (width >=  4) { x += ggml_gcn_xfer_xor_i32<2>(x); }
+    if constexpr (width >=  8) { x += ggml_gcn_xfer_xor_i32<4>(x); }
+    if constexpr (width >= 16) { x += ggml_gcn_xfer_xor_i32<8>(x); }
+    if constexpr (width >= 32) { x += ggml_gcn_xfer_xor_i32<16>(x); }
+    if constexpr (width >= 64) { x += __shfl_xor_sync(0xffffffff, x, 32, 64); }
+    return x;
+}
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_sum(int x) {
-#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+#if defined(GGML_USE_HIP) && defined(GCN)
+    return ggml_gcn_warp_reduce_sum_i32<width>(x);
+#elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
     return __reduce_add_sync(0xffffffff, x);
 #else
 #pragma unroll
@@ -445,21 +562,31 @@ static __device__ __forceinline__ int warp_reduce_sum(int x) {
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    return ggml_gcn_warp_reduce_sum_f32<width>(x);
+#else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         x += __shfl_xor_sync(0xffffffff, x, offset, width);
     }
     return x;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
 }
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float2 warp_reduce_sum(float2 a) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    a.x = ggml_gcn_warp_reduce_sum_f32<width>(a.x);
+    a.y = ggml_gcn_warp_reduce_sum_f32<width>(a.y);
+    return a;
+#else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         a.x += __shfl_xor_sync(0xffffffff, a.x, offset, width);
         a.y += __shfl_xor_sync(0xffffffff, a.y, offset, width);
     }
     return a;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
 }
 
 template<int width = WARP_SIZE>
@@ -505,11 +632,15 @@ static __device__ __forceinline__ int warp_reduce_any(int x) {
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_max(float x) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    return ggml_gcn_warp_reduce_max_f32<width>(x);
+#else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, offset, width));
     }
     return x;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
 }
 
 template<typename T, int width = WARP_SIZE>

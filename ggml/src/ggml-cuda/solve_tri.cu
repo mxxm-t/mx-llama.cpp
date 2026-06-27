@@ -2,8 +2,13 @@
 #include "ggml.h"
 #include "solve_tri.cuh"
 
-#define MAX_N_FAST 64
-#define MAX_K_FAST 32
+#define MAX_N_FAST  64
+#define MAX_K_FAST  64
+
+// Maximum threads in the k (column) dimension per block.
+// Capped so that WARP_SIZE * MAX_K_BLOCK <= 1024 (hardware thread limit).
+// When k > MAX_K_BLOCK, each y-thread loops over multiple columns.
+#define MAX_K_BLOCK 32
 
 static __global__ void get_batch_pointers(const float *  A,
                                           float *        X,
@@ -79,8 +84,13 @@ static void solve_tri_f32_cublas(ggml_backend_cuda_context & ctx,
 }
 
 // ======================
-// Fast Kernel (n <= 64, k <= 32) - Warp-based parallel reduction
+// Fast Kernel (n <= MAX_N_FAST, k <= MAX_K_FAST) - Warp-based parallel reduction
 // ======================
+// When k > MAX_K_BLOCK, each y-thread loops over multiple columns with stride
+// blockDim.y, keeping the total thread count within hardware limits (1024).
+// The A matrix is loaded once into shared memory; each column is then solved
+// independently using warp-parallel forward substitution.
+//
 // When ncols_template == 0 the bounds for the loops in this function are not
 // known and can't be unrolled. As we want to keep pragma unroll for all other
 // cases we suppress the clang transformation warning here.
@@ -102,15 +112,9 @@ static __global__ void solve_tri_f32_fast(const float * __restrict__ A,
                                           const int    n_arg,
                                           const int    k_arg) {
     const int n = n_template == 0 ? n_arg : n_template;
-    const int k = k_template == 0 ? k_arg : k_template;
 
     const int batch_idx = blockIdx.x;
     const int lane      = threadIdx.x;
-    const int col_idx   = threadIdx.y;
-
-    if (col_idx >= k) {
-        return;
-    }
 
     const uint2   i02_i03 = fast_div_modulo(batch_idx, ne02);
     const int64_t i02     = i02_i03.y;
@@ -122,59 +126,65 @@ static __global__ void solve_tri_f32_fast(const float * __restrict__ A,
 
     __shared__ float sA[MAX_N_FAST * MAX_N_FAST];
 
-    const int offset = threadIdx.x + threadIdx.y * blockDim.x;
+    // Load A into shared memory using all threads in the block.
+    const int total_threads = blockDim.x * blockDim.y;
+    const int tid           = threadIdx.x + threadIdx.y * blockDim.x;
 
-#pragma unroll
-    for (int i = 0; i < n * n; i += k * WARP_SIZE) {
-        const int i0 = i + offset;
-        if (i0 < n * n) {
-            sA[i0] = A_batch[i0];
-        }
+    for (int i = tid; i < n * n; i += total_threads) {
+        sA[i] = A_batch[i];
     }
 
     __syncthreads();
 
-    float x_low  = (lane < n) ? B_batch[lane * k + col_idx] : 0.0f;
-    float x_high = (WARP_SIZE + lane < n) ? B_batch[(WARP_SIZE + lane) * k + col_idx] : 0.0f;
+    // k_full is the actual number of columns to solve.
+    // Each y-thread loops over columns with stride blockDim.y (the tile width).
+    // When k_full <= blockDim.y this is a single iteration (no overhead).
+    const int k_full = k_template == 0 ? k_arg : k_template;
 
-    const int half      = WARP_SIZE;
-    const int nrows_low = (n < half) ? n : half;
+    for (int col_idx = threadIdx.y; col_idx < k_full; col_idx += blockDim.y) {
 
-#pragma unroll
-    for (int row = 0; row < nrows_low; ++row) {
-        float sum = 0.0f;
-        if (lane < row) {
-            sum += sA[row * n + lane] * x_low;
-        }
-        sum = warp_reduce_sum(sum);
+        float x_low  = (lane < n) ? B_batch[lane * k_full + col_idx] : 0.0f;
+        float x_high = (WARP_SIZE + lane < n) ? B_batch[(WARP_SIZE + lane) * k_full + col_idx] : 0.0f;
 
-        if (lane == row) {
-            x_low = (x_low - sum) / sA[row * n + row];
-        }
-    }
+        const int half      = WARP_SIZE;
+        const int nrows_low = (n < half) ? n : half;
 
 #pragma unroll
-    for (int row = half; row < n; ++row) {
-        float     sum = sA[row * n + lane] * x_low;
-        const int j   = half + lane;
-        if (j < row) {
-            sum += sA[row * n + j] * x_high;
-        }
-        sum = warp_reduce_sum(sum);
+        for (int row = 0; row < nrows_low; ++row) {
+            float sum = 0.0f;
+            if (lane < row) {
+                sum += sA[row * n + lane] * x_low;
+            }
+            sum = warp_reduce_sum(sum);
 
-        if (lane == row - half) {
-            x_high = (x_high - sum) / sA[row * n + row];
+            if (lane == row) {
+                x_low = (x_low - sum) / sA[row * n + row];
+            }
         }
-    }
 
 #pragma unroll
-    for (int rr = 0; rr < 2; ++rr) {
-        const int row = rr * WARP_SIZE + lane;
-        if (row < n) {
-            const float val            = (row < half) ? x_low : x_high;
-            X_batch[row * k + col_idx] = val;
+        for (int row = half; row < n; ++row) {
+            float     sum = sA[row * n + lane] * x_low;
+            const int j   = half + lane;
+            if (j < row) {
+                sum += sA[row * n + j] * x_high;
+            }
+            sum = warp_reduce_sum(sum);
+
+            if (lane == row - half) {
+                x_high = (x_high - sum) / sA[row * n + row];
+            }
         }
-    }
+
+#pragma unroll
+        for (int rr = 0; rr < 2; ++rr) {
+            const int row = rr * WARP_SIZE + lane;
+            if (row < n) {
+                const float val                 = (row < half) ? x_low : x_high;
+                X_batch[row * k_full + col_idx] = val;
+            }
+        }
+    } // end column loop
 }
 #ifdef __clang__
 #    pragma clang diagnostic pop
@@ -195,10 +205,15 @@ static void solve_tri_f32_cuda(const float * A,
                                size_t        nb3,
                                cudaStream_t  stream) {
     const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
-    dim3        threads(WARP_SIZE, k);
+    const int   k_block = (k <= MAX_K_BLOCK) ? k : MAX_K_BLOCK;
+    dim3        threads(WARP_SIZE, k_block);
     dim3        grid(ne02 * ne03);
     if (n == 64) {
         switch (k) {
+            case 64:
+                solve_tri_f32_fast<64, 64>
+                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0);
+                break;
             case 32:
                 solve_tri_f32_fast<64, 32>
                     <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0);
