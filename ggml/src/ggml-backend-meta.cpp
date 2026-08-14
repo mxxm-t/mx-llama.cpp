@@ -2965,6 +2965,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     // relayed. Rewind the seam to before its first write so the
                     // writes land on the same stage as the reads.
                     int snap_to = i;
+
+                    // Hyperconnection graphs finish the previous layer with l_last-N,
+                    // then begin constructing the next layer before an owning-stage
+                    // tensor makes the transition visible here.  Keep that final
+                    // residual update on the old stage and replay everything after it
+                    // on the new stage.  Otherwise the seam lands in the middle of the
+                    // next layer and transfers all of its partially-built state.
+                    const ggml_tensor * first = cgraph->nodes[i_start];
+                    if (i_start + 1 < i && std::strncmp(first->name, "l_last-", 7) == 0) {
+                        snap_to = i_start + 1;
+                    }
+
                     for (const auto & kv : persist_first_write) {
                         const int w = kv.second;
                         if (w < i_start || w >= i) continue;
