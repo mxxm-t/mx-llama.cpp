@@ -1642,6 +1642,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // the MTP prefill PP regression caused by the per-prefill-chunk target sync.
     bool deferred_prefill = false;
     bool prefilling       = false;
+    bool deferred_prefill_failed = false;
     float * prefill_accum_base = nullptr;      // pinned position-indexed [n_ctx][n_embd], owned by ctx_tgt
     struct prefill_chunk {
         std::vector<llama_token>   tok;
@@ -1820,7 +1821,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // one pass here, before generation starts, so the draft quality is identical to the
         // per-chunk path.
         if (deferred_prefill && prefilling) {
-            finish_deferred_prefill();
+            if (!finish_deferred_prefill()) {
+                deferred_prefill_failed = true;
+                SPC_ERR("%s", "deferred MTP prefill replay failed; disabling MTP drafts\n");
+            }
         }
 
         auto * ctx_dft = this->params.ctx_dft;
@@ -1955,7 +1959,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // prefill_accum (filled async during prefill via the context accum buffer). A single
     // synchronize drains those copies, then each buffered prompt chunk is mirrored into
     // ctx_dft exactly as the per-chunk path would have, producing an identical draft KV.
-    void finish_deferred_prefill() {
+    bool finish_deferred_prefill() {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
@@ -1972,15 +1976,43 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             llama_set_mtp_prefill_kv_only(ctx_dft, true);
         }
 
+        bool ok = base != nullptr || prefill_chunks.empty();
+        const size_t hidden_cap = llama_n_ctx(ctx_tgt);
+        std::vector<float> hidden_scratch;
         if (base != nullptr) {
             for (auto & ch : prefill_chunks) {
                 const int32_t nt = (int32_t) ch.tok.size();
                 if (nt <= 0) {
                     continue;
                 }
-                const llama_pos p0 = ch.pos[0];
-                const float * h_tgt = base + (size_t) p0 * n_embd;
-                process_decode(nt, ch.tok.data(), ch.pos.data(), ch.seq.data(), h_tgt);
+
+                bool contiguous = ch.pos[0] >= 0 && (size_t) ch.pos[0] < hidden_cap;
+                for (int32_t i = 1; i < nt; ++i) {
+                    contiguous = contiguous && ch.pos[i] == ch.pos[0] + i &&
+                        (size_t) ch.pos[i] < hidden_cap;
+                }
+
+                const float * h_tgt = nullptr;
+                if (contiguous) {
+                    h_tgt = base + (size_t) ch.pos[0] * n_embd;
+                } else {
+                    hidden_scratch.resize((size_t) nt * n_embd);
+                    for (int32_t i = 0; i < nt; ++i) {
+                        if (ch.pos[i] < 0 || (size_t) ch.pos[i] >= hidden_cap) {
+                            ok = false;
+                            break;
+                        }
+                        std::memcpy(hidden_scratch.data() + (size_t) i * n_embd,
+                                    base + (size_t) ch.pos[i] * n_embd,
+                                    (size_t) n_embd * sizeof(float));
+                    }
+                    h_tgt = hidden_scratch.data();
+                }
+
+                if (!ok || !process_decode(nt, ch.tok.data(), ch.pos.data(), ch.seq.data(), h_tgt)) {
+                    ok = false;
+                    break;
+                }
             }
         }
 
@@ -1992,6 +2024,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_pre_norm_accum(ctx_tgt, 0); // disable and free the pinned buffer
         prefill_accum_base = nullptr;
         prefilling = false;
+        return ok;
     }
 
     bool process(const llama_batch & batch_in) override {
@@ -2040,6 +2073,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
+
+        if (deferred_prefill_failed) {
+            return;
+        }
 
         common_batch_clear(batch);
 

@@ -309,18 +309,6 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_batch       = %u\n",   __func__, cparams.n_batch);
     LLAMA_LOG_INFO("%s: n_ubatch      = %u\n",   __func__, cparams.n_ubatch);
 
-    // Tiny-ubatch multi-GPU pipelining lets the host free-run ahead of lagging
-    // devices and race the sched's split-input copies (observed on ROCm, where
-    // enqueued cross-device event waits do not order reliably). Turn on the
-    // sched's host-drain for such configs before any sched is created. Setting
-    // the variable manually overrides this either way.
-    if (cparams.n_ubatch < 64) {
-#ifdef _WIN32
-        _putenv_s("GGML_SCHED_SYNC_NONGRAPH", "1");
-#else
-        setenv("GGML_SCHED_SYNC_NONGRAPH", "1", 0);
-#endif
-    }
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
@@ -652,7 +640,23 @@ void llama_context::sched_reserve() {
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    auto new_sched = [&](bool parallel) {
+        ggml_backend_sched_t result = ggml_backend_sched_new(
+            backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+            max_nodes, parallel, cparams.op_offload);
+
+        // Tiny-ubatch multi-GPU pipelining can race split-input reuse on ROCm.
+        // Keep the policy local to this context. An explicit environment value
+        // remains a diagnostic override sampled when the scheduler is created.
+        bool sync_non_graph_inputs = cparams.n_ubatch < 64;
+        if (const char * value = getenv("GGML_SCHED_SYNC_NONGRAPH")) {
+            sync_non_graph_inputs = atoi(value) != 0;
+        }
+        ggml_backend_sched_set_sync_non_graph_inputs(result, sync_non_graph_inputs);
+        return result;
+    };
+
+    sched.reset(new_sched(cparams.pipeline_parallel));
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -738,7 +742,7 @@ void llama_context::sched_reserve() {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
-                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                sched.reset(new_sched(false));
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -2271,15 +2275,33 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 // MTP deferred prefill: when an accum buffer is set (unmasked target during
                 // prompt prefill), extract straight into the position-indexed accum buffer
                 // and skip the per-batch embd_nextn copy, which is unused during prefill.
-                // This keeps the whole prompt hidden across decode calls without a per-chunk
-                // synchronize and avoids a second D2H. Assumes a contiguous ubatch (single
-                // sequence, sequential positions), which holds for prefill.
+                // Sequential positions use one D2H; unusual non-contiguous positions are
+                // copied row-by-row so replay indexes the actual positions safely.
                 const bool accum_active = embd_pre_norm_accum && !masked && ubatch.pos;
                 if (accum_active) {
-                    const int64_t p0 = ubatch.pos[0];
-                    if (p0 >= 0 && (size_t) (p0 + n_rows)*n_embd <= embd_pre_norm_accum_size) {
-                        float * dst = embd_pre_norm_accum + (size_t) p0*n_embd;
-                        ggml_backend_tensor_get_async(backend_h, t_h_nextn, dst, 0, n_rows*n_embd*sizeof(float));
+                    bool positions_valid = true;
+                    bool positions_contiguous = true;
+                    for (int64_t i = 0; i < n_rows; ++i) {
+                        const llama_pos pos = ubatch.pos[i];
+                        positions_valid = positions_valid && pos >= 0 &&
+                            ((size_t) pos + 1) * n_embd <= embd_pre_norm_accum_size;
+                        positions_contiguous = positions_contiguous &&
+                            (i == 0 || pos == ubatch.pos[0] + i);
+                    }
+
+                    if (positions_valid) {
+                        if (positions_contiguous) {
+                            float * dst = embd_pre_norm_accum + (size_t) ubatch.pos[0] * n_embd;
+                            ggml_backend_tensor_get_async(backend_h, t_h_nextn, dst, 0,
+                                    n_rows * n_embd * sizeof(float));
+                        } else {
+                            const size_t row_bytes = (size_t) n_embd * sizeof(float);
+                            for (int64_t i = 0; i < n_rows; ++i) {
+                                float * dst = embd_pre_norm_accum + (size_t) ubatch.pos[i] * n_embd;
+                                ggml_backend_tensor_get_async(backend_h, t_h_nextn, dst,
+                                        (size_t) i * row_bytes, row_bytes);
+                            }
+                        }
 
                         // The async extract reads t_h_nextn straight from the scheduler's
                         // rotating compute buffer (one slot per copy in the pipeline ring). With

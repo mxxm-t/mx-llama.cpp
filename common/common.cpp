@@ -1623,17 +1623,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-    // the DSpark draft head borrows the target's output projection and runs an in-graph
-    // argmax over the whole vocabulary on the logits it produces, which a vocabulary
-    // shard cannot serve. Replicate the projection when that drafter is in use. The
-    // decision travels through an env var so llama_model_params stays at the public
-    // upstream layout - llama_model::tensor_mirror_output reads it back at load.
-    const bool mirror_output = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
-#if defined(_WIN32)
-    _putenv_s("LLAMA_TENSOR_MIRROR_OUTPUT", mirror_output ? "1" : "0");
-#else
-    setenv("LLAMA_TENSOR_MIRROR_OUTPUT", mirror_output ? "1" : "0", 1);
-#endif
+    // The DSpark draft head borrows the target's output projection and runs an
+    // in-graph vocabulary-global argmax, which a vocabulary shard cannot serve.
+    // Keep this per-model: ordinary and DSpark models may share one process.
+    mparams.tensor_mirror_output =
+        std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
 
     return mparams;
 }

@@ -189,7 +189,7 @@ static void launch_gated_delta_net(
                 neqk1, rq3, scale, K, stream);
             return;
         }
-    } 
+    }
 
     const int device = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[device].warp_size;

@@ -880,6 +880,7 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+    bool sync_non_graph_inputs;
 
     int debug;
     struct ggml_backend_sched_timing timing;
@@ -2014,14 +2015,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // reliably hits the window (DSV4 -ub 4/32: gfxhub TCP faults). Every
                 // host-side bound closes it, so drain the destination in that regime
                 // only. Single-row (decode) and >= 64-row (production prefill) shapes
-                // keep the async pipeline. GGML_SCHED_SYNC_NONGRAPH=0/1 forces off/on.
-                {
-                    // Not static: llama sets this per-context (tiny n_ubatch) and
-                    // contexts with different n_ubatch share one process.
-                    const char * sync_env = getenv("GGML_SCHED_SYNC_NONGRAPH");
-                    if (sync_env != NULL && atoi(sync_env) != 0) {
-                        ggml_backend_synchronize(split_backend);
-                    }
+                // keep the async pipeline. This is configured per scheduler because
+                // contexts with different ubatch sizes can share one process.
+                if (sched->sync_non_graph_inputs) {
+                    ggml_backend_synchronize(split_backend);
                 }
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
@@ -2459,6 +2456,11 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_sync_non_graph_inputs(ggml_backend_sched_t sched, bool enabled) {
+    GGML_ASSERT(sched);
+    sched->sync_non_graph_inputs = enabled;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

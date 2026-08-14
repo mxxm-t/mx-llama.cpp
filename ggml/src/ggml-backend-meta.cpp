@@ -2392,6 +2392,14 @@ struct ggml_backend_meta_context {
 
     ~ggml_backend_meta_context() {
         prof_report();
+
+        // Captured graph executables are owned by their simple backends. Release
+        // them while those backends (and their CUDA/HIP contexts) are still alive.
+        for (auto & entry : tg_cache) {
+            tg_free_entry(entry);
+        }
+        tg_cache.clear();
+
         ggml_backend_comm_free_t comm_free = nullptr;
         if (xfer_comm_ctx != nullptr) {
             comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(

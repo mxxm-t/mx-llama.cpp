@@ -113,15 +113,11 @@ static __device__ __forceinline__ void barrier_end(
     __syncthreads();
     uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
     if (threadIdx.x < NRANKS) {
-        // Relaxed semantics — no downstream reads depend on this barrier's data.
-        asm volatile("st.volatile.global.u32 [%1], %0;" :: "r"(flag),
-                     "l"(&sg.signals[threadIdx.x]->end[blockIdx.x][rank]));
-        FlagType val;
-        do {
-            asm volatile("ld.volatile.global.u32 %0, [%1];"
-                         : "=r"(val)
-                         : "l"(&self_sg->end[blockIdx.x][threadIdx.x]));
-        } while (val != flag);
+        // Order completion of peer reads before a later collective reuses the
+        // same partial buffers. Match barrier_start's system-scope ordering.
+        st_flag_volatile(&sg.signals[threadIdx.x]->end[blockIdx.x][rank], flag);
+        while (ld_flag_volatile(&self_sg->end[blockIdx.x][threadIdx.x]) != flag)
+            ;
     }
     if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
 }

@@ -368,6 +368,10 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // Force a host drain before overwriting non-graph inputs. Used by contexts
+    // whose tiny ubatches can outrun cross-device event ordering.
+    GGML_API void                 ggml_backend_sched_set_sync_non_graph_inputs(ggml_backend_sched_t sched, bool enabled);
+
     //
     // Meta backend
     //
