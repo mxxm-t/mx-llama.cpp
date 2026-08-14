@@ -679,8 +679,11 @@ void llama_context::sched_reserve() {
     // shifts and runtime graphs stop fitting the reserved plan - measured as an
     // unexpected same-size graph reallocation (plus its all-backend synchronize)
     // on EVERY prefill chunk, costing 2.4x prefill under -sm layer. Tensor split
-    // keeps the in-arena taps: its meta backend manages its own buffers and does
-    // not exhibit the realloc. LLAMA_TAP_STATIC=0 restores the old behavior.
+    // does not exhibit that realloc, but its in-arena tap readbacks still require
+    // a full scheduler drain whenever the compute ring wraps. A persistent tap
+    // replaces that drain with the event dependency in graph_compute. This is
+    // especially important for deferred DSpark prefill. LLAMA_TAP_STATIC=0
+    // restores in-arena taps for all split modes.
     layer_inp_dev.assign(cparams.embeddings_layer_inp.size(), nullptr);
     buf_layer_inp_dev.reset();
     ctx_layer_inp_dev.reset();
@@ -691,13 +694,7 @@ void llama_context::sched_reserve() {
         for (bool enabled : cparams.embeddings_layer_inp) {
             n_taps += enabled ? 1 : 0;
         }
-        // Tensor split defaults to in-arena taps because it does not show the
-        // realloc that motivated the persistent copy. That also excludes it from
-        // the event-ordered tap path, which is what gave -sm layer its prefill
-        // win, so LLAMA_TAP_STATIC=1 opts it in.
-        const bool tap_static_forced = s_tap_static != nullptr && atoi(s_tap_static) != 0;
-        const bool split_ok = model.split_mode() != LLAMA_SPLIT_MODE_TENSOR || tap_static_forced;
-        if (want_static && n_taps > 0 && split_ok && model.dev_output()) {
+        if (want_static && n_taps > 0 && model.dev_output()) {
             const ggml_init_params ip = {
                 /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) n_taps,
                 /*.mem_buffer =*/ nullptr,
