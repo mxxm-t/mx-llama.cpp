@@ -826,6 +826,7 @@ struct ggml_backend_sched_timing {
     int64_t us_moe_expert_set;
     int64_t us_graph_compute_enqueue;
     int64_t us_split_event_record;
+    int64_t us_input_staging_alloc;
 };
 
 struct ggml_backend_sched {
@@ -977,12 +978,12 @@ static void ggml_backend_sched_timing_maybe_print(ggml_backend_sched_t sched) {
         "%s: us non_graph_wait=%" PRId64 " stage_wait=%" PRId64 " memcpy=%" PRId64
         " set_async=%" PRId64 " async_try=%" PRId64 " fallback_wait=%" PRId64
         " fallback_copy=%" PRId64 " moe_ids=%" PRId64 " moe_expert_set=%" PRId64
-        " graph_enqueue=%" PRId64 " split_event_record=%" PRId64 "\n",
+        " graph_enqueue=%" PRId64 " split_event_record=%" PRId64 " staging_alloc=%" PRId64 "\n",
         __func__, t->us_non_graph_input_wait, t->us_non_graph_input_stage_wait,
         t->us_non_graph_input_memcpy, t->us_non_graph_input_set_async,
         t->us_non_graph_input_async_try, t->us_non_graph_input_fallback_wait,
         t->us_non_graph_input_fallback_copy, t->us_moe_ids, t->us_moe_expert_set,
-        t->us_graph_compute_enqueue, t->us_split_event_record);
+        t->us_graph_compute_enqueue, t->us_split_event_record, t->us_input_staging_alloc);
 
     ggml_backend_sched_timing_reset(t);
 }
@@ -1017,25 +1018,73 @@ static void ggml_backend_sched_free_input_staging(ggml_backend_sched_t sched) {
     sched->input_staging_capacity = 0;
 }
 
+static ggml_backend_sched_input_staging * ggml_backend_sched_find_input_staging(
+        ggml_backend_sched_t sched,
+        size_t tensor_id,
+        int backend_id,
+        int copy_id) {
+    for (int i = 0; i < sched->n_input_staging; i++) {
+        ggml_backend_sched_input_staging * slot = &sched->input_staging[i];
+        if (slot->tensor_id == tensor_id && slot->backend_id == backend_id && slot->copy_id == copy_id) {
+            return slot;
+        }
+    }
+    return nullptr;
+}
+
+static void ggml_backend_sched_resize_input_staging(
+        ggml_backend_sched_t sched,
+        ggml_backend_sched_input_staging * slot,
+        size_t size) {
+    const int64_t t0 = ggml_backend_sched_timing_now(sched);
+    ggml_backend_buffer_free(slot->buffer);
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[slot->backend_id]);
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
+    if (buft == nullptr) {
+        buft = ggml_backend_cpu_buffer_type();
+    }
+
+    slot->buffer = ggml_backend_buft_alloc_buffer(buft, size);
+    sched->timing.us_input_staging_alloc += ggml_backend_sched_timing_dt(sched, t0);
+    GGML_ASSERT(slot->buffer != nullptr);
+    slot->size = size;
+}
+
 static ggml_backend_sched_input_staging * ggml_backend_sched_get_input_staging(
         ggml_backend_sched_t sched,
         size_t tensor_id,
         int backend_id,
         int copy_id,
-        size_t size) {
+        size_t size,
+        enum ggml_type type) {
     GGML_ASSERT(size > 0);
 
-    ggml_backend_sched_input_staging * slot = nullptr;
+    ggml_backend_sched_input_staging * slot = ggml_backend_sched_find_input_staging(
+        sched, tensor_id, backend_id, copy_id);
+    bool has_staging_ring = slot != nullptr;
     for (int i = 0; i < sched->n_input_staging; i++) {
-        ggml_backend_sched_input_staging * cur = &sched->input_staging[i];
-        if (cur->tensor_id == tensor_id && cur->backend_id == backend_id && cur->copy_id == copy_id) {
-            slot = cur;
+        const ggml_backend_sched_input_staging * cur = &sched->input_staging[i];
+        if (cur->tensor_id == tensor_id && cur->backend_id == backend_id) {
+            has_staging_ring = true;
             break;
         }
     }
+    static const bool preallocate_ring = ggml_backend_sched_env_int(
+        "GGML_SCHED_PREALLOCATE_STAGING_RING", 1) != 0;
 
     if (slot == nullptr) {
-        if (sched->n_input_staging == sched->input_staging_capacity) {
+        // hipHostMalloc/hipHostFree may synchronize the device. Lazily creating
+        // one pinned source buffer each time the scheduler advances cur_copy
+        // therefore drains a newly enqueued pipeline once per graph reset. On
+        // the first use of a tensor, create the complete staging ring while no
+        // older copy of that tensor can be in flight. Later size growth remains
+        // local to the current, event-guarded copy.
+        const int first_copy = !has_staging_ring && preallocate_ring ? 0 : copy_id;
+        const int last_copy  = !has_staging_ring && preallocate_ring ? sched->n_copies : copy_id + 1;
+        const int n_new_slots = last_copy - first_copy;
+
+        while (sched->n_input_staging + n_new_slots > sched->input_staging_capacity) {
             sched->input_staging_capacity = sched->input_staging_capacity == 0 ? 16 : sched->input_staging_capacity*2;
             sched->input_staging = (ggml_backend_sched_input_staging *) realloc(
                 sched->input_staging,
@@ -1043,14 +1092,18 @@ static ggml_backend_sched_input_staging * ggml_backend_sched_get_input_staging(
             GGML_ASSERT(sched->input_staging != nullptr);
         }
 
-        slot = &sched->input_staging[sched->n_input_staging++];
-        *slot = {
-            /* .tensor_id  = */ tensor_id,
-            /* .backend_id = */ backend_id,
-            /* .copy_id    = */ copy_id,
-            /* .size       = */ 0,
-            /* .buffer     = */ nullptr,
-        };
+        for (int c = first_copy; c < last_copy; c++) {
+            ggml_backend_sched_input_staging * new_slot = &sched->input_staging[sched->n_input_staging++];
+            *new_slot = {
+                /* .tensor_id  = */ tensor_id,
+                /* .backend_id = */ backend_id,
+                /* .copy_id    = */ c,
+                /* .size       = */ 0,
+                /* .buffer     = */ nullptr,
+            };
+        }
+        slot = ggml_backend_sched_find_input_staging(sched, tensor_id, backend_id, copy_id);
+        GGML_ASSERT(slot != nullptr);
     }
 
     if (slot->buffer == nullptr || slot->size < size) {
@@ -1059,23 +1112,28 @@ static ggml_backend_sched_input_staging * ggml_backend_sched_get_input_staging(
         // one ubatch worth of mask on every prefill step drains the pipeline
         // once per step. Rounding up amortizes that to O(log n) reallocations
         // over a prefill: 16k-context tps4 prefill 380 -> 445 t/s.
-        size_t alloc_size = 1024*1024;
+        size_t alloc_size = 64*1024;
         while (alloc_size < size) {
             alloc_size *= 2;
         }
+        // DSV4 attention masks grow on every prefill chunk. Give their ring
+        // enough initial headroom to cover the common multi-chunk prefill
+        // window without allocating pinned memory behind active kernels.
+        if (!has_staging_ring && preallocate_ring && type == GGML_TYPE_F16) {
+            alloc_size = std::max<size_t>(alloc_size, 4*1024*1024);
+        }
         size = alloc_size;
 
-        ggml_backend_buffer_free(slot->buffer);
-
-        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[backend_id]);
-        ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
-        if (buft == nullptr) {
-            buft = ggml_backend_cpu_buffer_type();
+        if (!has_staging_ring && preallocate_ring) {
+            for (int c = 0; c < sched->n_copies; c++) {
+                ggml_backend_sched_input_staging * ring_slot = ggml_backend_sched_find_input_staging(
+                    sched, tensor_id, backend_id, c);
+                GGML_ASSERT(ring_slot != nullptr && ring_slot->buffer == nullptr);
+                ggml_backend_sched_resize_input_staging(sched, ring_slot, size);
+            }
+        } else {
+            ggml_backend_sched_resize_input_staging(sched, slot, size);
         }
-
-        slot->buffer = ggml_backend_buft_alloc_buffer(buft, size);
-        GGML_ASSERT(slot->buffer != nullptr);
-        slot->size = size;
     }
 
     return slot;
@@ -1111,7 +1169,7 @@ static size_t ggml_backend_sched_input_staging_type_max_size(ggml_backend_t back
         case GGML_TYPE_I64: {
             static const size_t max_size = []() {
                 const char * env = getenv("GGML_SCHED_INPUT_STAGING_I64_MAX");
-                return env != nullptr ? (size_t) atoll(env) : (size_t) 64;
+                return env != nullptr ? (size_t) atoll(env) : (size_t) 1024*1024;
             }();
             return max_size;
         }
@@ -1121,7 +1179,7 @@ static size_t ggml_backend_sched_input_staging_type_max_size(ggml_backend_t back
                 return env != nullptr ? (size_t) atoll(env) : (size_t) -1;
             }();
             return max_size != (size_t) -1 ? max_size :
-                (ggml_backend_sched_backend_is_multi_meta(backend) ? (size_t) 4096 : (size_t) 0);
+                (ggml_backend_sched_backend_is_multi_meta(backend) ? (size_t) 1024*1024 : (size_t) 0);
         }
         case GGML_TYPE_F16: {
             // f16 kq masks are the largest per-ubatch inputs (n_kv x n_ubatch).
@@ -1146,7 +1204,7 @@ static size_t ggml_backend_sched_non_graph_input_staging_max_size(ggml_backend_t
         return env != nullptr ? (size_t) atoll(env) : (size_t) -1;
     }();
     return max_size != (size_t) -1 ? max_size :
-        (ggml_backend_sched_backend_is_multi_meta(backend) ? (size_t) 32768 : (size_t) 0);
+        (ggml_backend_sched_backend_is_multi_meta(backend) ? (size_t) 64*1024*1024 : (size_t) 0);
 }
 
 static bool ggml_backend_sched_should_stage_input(ggml_backend_t backend, const ggml_tensor * input, size_t size) {
@@ -1957,7 +2015,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                         const size_t input_id_hash = hash_id(input);
                         ggml_backend_sched_input_staging * staging = ggml_backend_sched_get_input_staging(
-                            sched, input_id_hash, split_backend_id, sched->cur_copy, input_size);
+                            sched, input_id_hash, split_backend_id, sched->cur_copy, input_size, input->type);
                         {
                             void * input_staging = ggml_backend_buffer_get_base(staging->buffer);
                             GGML_ASSERT(input_staging != nullptr);
@@ -2150,7 +2208,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                             const size_t input_id_hash = hash_id(input);
                             ggml_backend_sched_input_staging * staging = ggml_backend_sched_get_input_staging(
-                                sched, input_id_hash, split_backend_id, sched->cur_copy, input_size);
+                                sched, input_id_hash, split_backend_id, sched->cur_copy, input_size, input->type);
                             void * input_staging = ggml_backend_buffer_get_base(staging->buffer);
                             GGML_ASSERT(input_staging != nullptr);
 
