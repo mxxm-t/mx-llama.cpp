@@ -126,9 +126,16 @@ struct llama_context {
     // layer-input taps (DFlash/DSpark deferred prompt encode). One region per tap layer
     // enabled at the time of the call. Returns the buffer base (or nullptr).
     float * set_embeddings_layer_inp_accum(int32_t n_tokens_cap);
-    // Returns the base of lid's region (or nullptr). Does NOT synchronize - callers
-    // must bound the read with layer_inp_accum_wait or a full synchronize.
+    // Returns the base of lid's region for sequence zero (or nullptr). Does NOT
+    // synchronize - callers must bound the read with a readiness wait or a full
+    // synchronize. The sequence-aware form is required when n_seq_max > 1.
     const float * get_embeddings_layer_inp_accum(uint32_t lid);
+    const float * get_embeddings_layer_inp_accum_seq(uint32_t lid, llama_seq_id seq_id);
+    // Return the readiness epoch covering every row in [p0, p0 + n_tokens) for
+    // seq_id, or zero when any row was not accumulated.
+    uint64_t layer_inp_accum_span_epoch(llama_seq_id seq_id, llama_pos p0, int32_t n_tokens) const;
+    bool layer_inp_accum_wait_epoch(uint64_t epoch);
+    bool layer_inp_accum_ready_epoch(uint64_t epoch);
     // Block until every accum row below position p_end is on the host, using the
     // per-ubatch readiness events - unlike a full synchronize this does not wait for
     // work enqueued after the covering ubatch. Returns false when no live event
@@ -346,16 +353,24 @@ private:
     // the target's prefill keeps its cross-ubatch pipeline overlap.
     ggml_backend_buffer_ptr buf_layer_inp_accum;
     float * layer_inp_accum     = nullptr;  // base of buf_layer_inp_accum (pinned), or null
-    int32_t layer_inp_accum_cap = 0;        // capacity in tokens per region
+    int32_t layer_inp_accum_cap = 0;        // capacity in tokens per sequence and region
+    int32_t layer_inp_accum_n_seq = 0;
     int64_t layer_inp_accum_ub  = 0;        // ubatch counter for the ring-wrap drain
     std::vector<int32_t> layer_inp_accum_idx; // lid -> region index, or -1
+    std::vector<uint64_t> layer_inp_accum_row_epoch; // [seq][position]
+    uint64_t layer_inp_accum_epoch = 0;
 
     // Per-ubatch readiness events for the accum: recorded on the tap's backend right
     // after the ubatch's copies are enqueued, so event N firing guarantees every row
     // written up to and including ubatch N. Small ring, re-recorded round robin.
+    struct layer_inp_accum_backend_ev {
+        ggml_backend_t       backend = nullptr;
+        ggml_backend_event_t event   = nullptr;
+    };
     struct layer_inp_accum_ev {
-        ggml_backend_event_t event = nullptr;
+        std::vector<layer_inp_accum_backend_ev> events;
         llama_pos pos_end = -1;
+        uint64_t  epoch   = 0;
     };
     std::vector<layer_inp_accum_ev> layer_inp_accum_events;
     size_t layer_inp_accum_ev_next = 0;

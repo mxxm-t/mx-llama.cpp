@@ -142,9 +142,16 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 // gather+encode to the first draft and keep the target's prefill pipeline overlap.
 // Returns the buffer base (or nullptr on failure/disable).
 LLAMA_API float * llama_set_embeddings_layer_inp_accum(struct llama_context * ctx, int32_t n_tokens_cap);
-// Returns the base of lid's accum region (or nullptr). Does NOT synchronize -
-// bound the read with llama_layer_inp_accum_wait or a full llama_synchronize.
+// Returns the base of lid's accum region for sequence zero (or nullptr). Does
+// NOT synchronize; bound the read with a readiness wait or a full
+// llama_synchronize. Use the sequence-aware form when n_seq_max > 1.
 LLAMA_API const float * llama_get_embeddings_layer_inp_accum(struct llama_context * ctx, uint32_t lid);
+LLAMA_API const float * llama_get_embeddings_layer_inp_accum_seq(
+        struct llama_context * ctx, uint32_t lid, llama_seq_id seq_id);
+LLAMA_API uint64_t llama_layer_inp_accum_span_epoch(
+        struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, int32_t n_tokens);
+LLAMA_API bool llama_layer_inp_accum_wait_epoch(struct llama_context * ctx, uint64_t epoch);
+LLAMA_API bool llama_layer_inp_accum_ready_epoch(struct llama_context * ctx, uint64_t epoch);
 // Block until every accum row below position p_end is on the host, using the
 // per-ubatch readiness events. Unlike llama_synchronize this does not wait for
 // work enqueued afterwards. Returns false when no live event covers p_end - the

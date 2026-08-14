@@ -975,6 +975,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         llama_seq_id seq_id;
         llama_pos    p0;
         int32_t      n;
+        uint64_t     epoch;
     };
     std::vector<pending_chunk> pending;
     bool accum_enabled = false;
@@ -1068,14 +1069,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // Position-indexed tap accum lets process() skip its per-chunk target
         // synchronize during prompt prefill. That synchronize flushes the target's
         // async pipeline after every prefill ubatch, which is the bulk of the DFlash
-        // prefill cost. Single sequence only - the accum is indexed by position and
-        // multiple sequences would collide. LLAMA_DFLASH_DEFER=0 restores the eager
-        // per-chunk path.
+        // prefill cost. The target accum is partitioned by sequence, so configured
+        // server slots do not disable this path. LLAMA_DFLASH_DEFER=0 restores the
+        // eager per-chunk path.
         {
             const char * s = getenv("LLAMA_DFLASH_DEFER");
             const bool want = s == nullptr || atoi(s) != 0;
-            if (want && n_seq == 1) {
-                accum_enabled = llama_set_embeddings_layer_inp_accum(ctx_tgt, (int32_t) llama_n_ctx(ctx_tgt)) != nullptr;
+            if (want) {
+                accum_enabled = llama_set_embeddings_layer_inp_accum(
+                    ctx_tgt, (int32_t) llama_n_ctx_seq(ctx_tgt)) != nullptr;
             }
             LOG_INF("%s: deferred prompt encode %s\n", __func__, accum_enabled ? "enabled" : "disabled");
         }
@@ -1139,7 +1141,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const char * e = getenv("LLAMA_DSPARK_DRAFT_WINDOW");
             return e != nullptr ? atoi(e) : 0;
         }();
-        if (draft_window > 0 && count > 1) {
+        if (draft_window > 0 && count > 1 && n_seq == 1) {
             const auto & newest = pending[count - 1];
             const llama_pos keep_from = newest.p0 + newest.n - draft_window;
             size_t drop = 0;
@@ -1152,20 +1154,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
-        std::vector<const float *> accum(target_layer_ids_n, nullptr);
-        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-            accum[k] = llama_get_embeddings_layer_inp_accum(ctx_tgt, (uint32_t) target_layer_ids[k]);
-            if (!accum[k]) {
-                GGML_ABORT("DFlash: target layer %d accum not available.", target_layer_ids[k]);
-            }
-        }
-
         // one wait covers every chunk in scope - stream order means the event of
         // the last one implies all earlier rows have arrived
         {
             common_time_meas tm_tgtsync(t_pp_tgtsync_us, !gen_perf);
             const auto & last = pending[count - 1];
-            if (!llama_layer_inp_accum_wait(ctx_tgt, last.p0 + last.n)) {
+            if (!llama_layer_inp_accum_wait_epoch(ctx_tgt, last.epoch)) {
                 llama_synchronize(ctx_tgt);
             }
         }
@@ -1177,6 +1171,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<std::vector<float>> g_rows(count);
         for (size_t c = 0; c < count; ++c) {
             const auto & pc = pending[c];
+            std::vector<const float *> accum(target_layer_ids_n, nullptr);
+            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                accum[k] = llama_get_embeddings_layer_inp_accum_seq(
+                    ctx_tgt, (uint32_t) target_layer_ids[k], pc.seq_id);
+                if (!accum[k]) {
+                    GGML_ABORT("DFlash: target layer %d accum not available for seq %d.",
+                            target_layer_ids[k], (int) pc.seq_id);
+                }
+            }
             {
                 common_time_meas tm_gather(t_pp_gather_us, !gen_perf);
                 features_buf.resize((size_t) pc.n * n_embd_enc);
@@ -1263,19 +1266,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_tokens = batch_in.n_tokens;
 
-        // per-seq inclusive batch range (assumes each seq's tokens are contiguous in the batch)
-        std::vector<int32_t> i_batch_beg(n_seq, -1);
-        std::vector<int32_t> i_batch_end(n_seq, -1);
+        // Preserve the exact source row for every sequence. Combined server
+        // batches need not keep all rows of a sequence contiguous.
+        std::vector<std::vector<int32_t>> i_batch_rows(n_seq);
         for (int32_t k = 0; k < n_tokens; ++k) {
             GGML_ASSERT(batch_in.n_seq_id[k] == 1);
             const llama_seq_id seq_id = batch_in.seq_id[k][0];
             if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
                 continue;
             }
-            i_batch_end[seq_id] = k;
-            if (i_batch_beg[seq_id] < 0) {
-                i_batch_beg[seq_id] = k;
-            }
+            i_batch_rows[seq_id].push_back(k);
         }
 
         auto * ctx_tgt = this->params.ctx_tgt;
@@ -1284,10 +1284,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_batch_beg[seq_id] < 0) {
+            const auto & rows = i_batch_rows[seq_id];
+            if (rows.empty()) {
                 continue;
             }
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            const int32_t n_rows = (int32_t) rows.size();
 
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
@@ -1306,63 +1307,67 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // the target. The accum holds the tap rows at their positions and
                 // flush_pending() replays the encode at the first draft.
                 if (is_pp && accum_enabled) {
-                    const int32_t ib = i_batch_beg[seq_id] + offset;
+                    const int32_t ib = rows[offset];
                     bool seq_pos = true;
                     for (int32_t i = 1; i < n_chunk; ++i) {
-                        if (batch_in.pos[ib + i] != batch_in.pos[ib] + i) {
+                        if (batch_in.pos[rows[offset + i]] != batch_in.pos[ib] + i) {
                             seq_pos = false;
                             break;
                         }
                     }
                     if (seq_pos) {
-                        pending.push_back({seq_id, batch_in.pos[ib], n_chunk});
-                        // lag-one flush: replay every pending chunk except the one
-                        // just recorded. Its readiness event bounds the wait to
-                        // work already finished, so the target keeps computing the
-                        // newest chunk while the draft encodes and injects - the
-                        // same GPU overlap the eager path got from serializing.
-                        //
-                        // Flushing per call ties the drafter's cost to the caller's
-                        // batch size: each flush host-blocks on the readiness event,
-                        // and a host stuck in the replay is not feeding the target,
-                        // so the target's pipeline drains and has to refill. Over a
-                        // 16k prefill that wait is 58.2s of 63.0s across 8 flushes
-                        // against 13.9s across 1. Accumulate rows so the flush count
-                        // follows the prompt rather than -b. The bound is what keeps
-                        // it honest: deferred chunks hold their draft hidden state in
-                        // g_rows until the injects run, ~16 KB per row, and past ~32k
-                        // rows that buys nothing anyway - a long prompt does enough
-                        // work per call to hide the drain. 0 flushes every call.
-                        static const int32_t flush_rows = []() {
-                            const char * e = getenv("LLAMA_DSPARK_FLUSH_ROWS");
-                            return e != nullptr ? atoi(e) : 32768;
-                        }();
-                        static const bool opportunistic = []() {
-                            const char * e = getenv("LLAMA_DSPARK_OPPORTUNISTIC");
-                            return e == nullptr || atoi(e) != 0;
-                        }();
-                        int32_t rows_ready = 0;
-                        for (size_t i = 0; i + 1 < pending.size(); ++i) {
-                            rows_ready += pending[i].n;
+                        const uint64_t epoch = llama_layer_inp_accum_span_epoch(
+                            ctx_tgt, seq_id, batch_in.pos[ib], n_chunk);
+                        if (epoch != 0) {
+                            pending.push_back({seq_id, batch_in.pos[ib], n_chunk, epoch});
+                            // Lag-one flush: replay every pending chunk except the one
+                            // just recorded. Its readiness event bounds the wait to
+                            // work already finished, so the target keeps computing the
+                            // newest chunk while the draft encodes and injects - the
+                            // same GPU overlap the eager path got from serializing.
+                            //
+                            // Flushing per call ties the drafter's cost to the caller's
+                            // batch size: each flush host-blocks on the readiness event,
+                            // and a host stuck in the replay is not feeding the target,
+                            // so the target's pipeline drains and has to refill. Over a
+                            // 16k prefill that wait is 58.2s of 63.0s across 8 flushes
+                            // against 13.9s across 1. Accumulate rows so the flush count
+                            // follows the prompt rather than -b. The bound is what keeps
+                            // it honest: deferred chunks hold their draft hidden state in
+                            // g_rows until the injects run, ~16 KB per row, and past ~32k
+                            // rows that buys nothing anyway - a long prompt does enough
+                            // work per call to hide the drain. 0 flushes every call.
+                            static const int32_t flush_rows = []() {
+                                const char * e = getenv("LLAMA_DSPARK_FLUSH_ROWS");
+                                return e != nullptr ? atoi(e) : 32768;
+                            }();
+                            static const bool opportunistic = []() {
+                                const char * e = getenv("LLAMA_DSPARK_OPPORTUNISTIC");
+                                return e == nullptr || atoi(e) != 0;
+                            }();
+                            int32_t rows_ready = 0;
+                            for (size_t i = 0; i + 1 < pending.size(); ++i) {
+                                rows_ready += pending[i].n;
+                            }
+                            // Replay early only when the target has ALREADY passed
+                            // these rows. The wait inside the flush is an event
+                            // synchronize, and events fire in stream order, so it
+                            // blocks until the device reaches that position - the
+                            // host gives up its whole queue lead and the target
+                            // drains behind it. Asking first turns the drafter into
+                            // a consumer of finished work: if the rows are not ready
+                            // the host returns to feeding the target and tries again
+                            // on the next call, by which point they usually are.
+                            bool do_flush = pending.size() > 1 && rows_ready >= flush_rows;
+                            if (do_flush && opportunistic) {
+                                const auto & last = pending[pending.size() - 2];
+                                do_flush = llama_layer_inp_accum_ready_epoch(ctx_tgt, last.epoch);
+                            }
+                            if (do_flush && !flush_pending_upto(pending.size() - 1)) {
+                                return false;
+                            }
+                            continue;
                         }
-                        // Replay early only when the target has ALREADY passed
-                        // these rows. The wait inside the flush is an event
-                        // synchronize, and events fire in stream order, so it
-                        // blocks until the device reaches that position - the
-                        // host gives up its whole queue lead and the target
-                        // drains behind it. Asking first turns the drafter into
-                        // a consumer of finished work: if the rows are not ready
-                        // the host returns to feeding the target and tries again
-                        // on the next call, by which point they usually are.
-                        bool do_flush = pending.size() > 1 && rows_ready >= flush_rows;
-                        if (do_flush && opportunistic) {
-                            const auto & last = pending[pending.size() - 2];
-                            do_flush = llama_layer_inp_accum_ready(ctx_tgt, last.p0 + last.n);
-                        }
-                        if (do_flush && !flush_pending_upto(pending.size() - 1)) {
-                            return false;
-                        }
-                        continue;
                     }
                 }
 
@@ -1398,7 +1403,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                         for (int32_t i = 0; i < n_chunk; ++i) {
                             float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                            const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                            const float * src = layer + (size_t) rows[offset + i] * n_embd_tgt;
                             std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                         }
                     }
@@ -1438,7 +1443,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
 
                 for (int32_t i = 0; i < n_chunk; ++i) {
-                    batch_inject.pos[i]       = batch_in.pos[i_batch_beg[seq_id] + offset + i];
+                    batch_inject.pos[i]       = batch_in.pos[rows[offset + i]];
                     batch_inject.n_seq_id[i]  = 1;
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;

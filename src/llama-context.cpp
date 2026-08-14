@@ -1333,7 +1333,10 @@ float * llama_context::set_embeddings_layer_inp_accum(int32_t n_tokens_cap) {
     buf_layer_inp_accum.reset();
     layer_inp_accum     = nullptr;
     layer_inp_accum_cap = 0;
+    layer_inp_accum_n_seq = 0;
     layer_inp_accum_idx.assign(cparams.embeddings_layer_inp.size(), -1);
+    layer_inp_accum_row_epoch.clear();
+    layer_inp_accum_epoch = 0;
     layer_inp_accum_events_free();
 
     if (n_tokens_cap <= 0) {
@@ -1351,7 +1354,8 @@ float * llama_context::set_embeddings_layer_inp_accum(int32_t n_tokens_cap) {
     }
 
     const uint32_t n_embd  = model.hparams.n_embd; // matches the t_layer_inp row stride
-    const size_t   nfloats = (size_t) n_regions * n_tokens_cap * n_embd;
+    const int32_t  n_seq   = (int32_t) cparams.n_seq_max;
+    const size_t   nfloats = (size_t) n_regions * n_seq * n_tokens_cap * n_embd;
     const size_t   nbytes  = nfloats * sizeof(float);
 
     // Pinned host buffer so the per-ubatch tap D2H stays truly asynchronous (a D2H
@@ -1371,8 +1375,8 @@ float * llama_context::set_embeddings_layer_inp_accum(int32_t n_tokens_cap) {
         return nullptr;
     }
 
-    LLAMA_LOG_INFO("%s: layer-inp accum: %d regions x %d tokens, %.2f MiB pinned\n",
-            __func__, n_regions, n_tokens_cap, nbytes / (1024.0 * 1024.0));
+    LLAMA_LOG_INFO("%s: layer-inp accum: %d regions x %d seq x %d tokens, %.2f MiB pinned\n",
+            __func__, n_regions, n_seq, n_tokens_cap, nbytes / (1024.0 * 1024.0));
 
     // Clear so any prompt position that is never extracted (e.g. served from the
     // prompt cache without a fresh decode) reads as zero rather than garbage.
@@ -1380,23 +1384,55 @@ float * llama_context::set_embeddings_layer_inp_accum(int32_t n_tokens_cap) {
 
     layer_inp_accum     = (float *) ggml_backend_buffer_get_base(buf_layer_inp_accum.get());
     layer_inp_accum_cap = n_tokens_cap;
+    layer_inp_accum_n_seq = n_seq;
     layer_inp_accum_ub  = 0;
+    layer_inp_accum_row_epoch.assign((size_t) n_seq * n_tokens_cap, 0);
     return layer_inp_accum;
 }
 
 const float * llama_context::get_embeddings_layer_inp_accum(uint32_t lid) {
+    return get_embeddings_layer_inp_accum_seq(lid, 0);
+}
+
+const float * llama_context::get_embeddings_layer_inp_accum_seq(uint32_t lid, llama_seq_id seq_id) {
     if (!layer_inp_accum || lid >= layer_inp_accum_idx.size() || layer_inp_accum_idx[lid] < 0) {
         return nullptr;
     }
+    if (seq_id < 0 || seq_id >= layer_inp_accum_n_seq) {
+        return nullptr;
+    }
     const uint32_t n_embd = model.hparams.n_embd;
-    return layer_inp_accum + (size_t) layer_inp_accum_idx[lid] * layer_inp_accum_cap * n_embd;
+    const size_t region_seq = (size_t) layer_inp_accum_idx[lid] * layer_inp_accum_n_seq + seq_id;
+    return layer_inp_accum + region_seq * layer_inp_accum_cap * n_embd;
+}
+
+uint64_t llama_context::layer_inp_accum_span_epoch(
+        llama_seq_id seq_id, llama_pos p0, int32_t n_tokens) const {
+    if (seq_id < 0 || seq_id >= layer_inp_accum_n_seq || p0 < 0 || n_tokens <= 0 ||
+            (size_t) p0 + n_tokens > (size_t) layer_inp_accum_cap) {
+        return 0;
+    }
+
+    uint64_t epoch = 0;
+    const size_t offset = (size_t) seq_id * layer_inp_accum_cap + p0;
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        const uint64_t row_epoch = layer_inp_accum_row_epoch[offset + i];
+        if (row_epoch == 0) {
+            return 0;
+        }
+        epoch = std::max(epoch, row_epoch);
+    }
+    return epoch;
 }
 
 void llama_context::layer_inp_accum_events_free() {
     for (auto & ev : layer_inp_accum_events) {
-        if (ev.event) {
-            ggml_backend_event_free(ev.event);
+        for (auto & backend_ev : ev.events) {
+            if (backend_ev.event) {
+                ggml_backend_event_free(backend_ev.event);
+            }
         }
+        ev.events.clear();
     }
     layer_inp_accum_events.clear();
     layer_inp_accum_ev_next = 0;
@@ -1407,14 +1443,16 @@ bool llama_context::layer_inp_accum_wait(llama_pos p_end) {
     // p_end. The one with the smallest such pos_end minimizes the wait.
     const layer_inp_accum_ev * best = nullptr;
     for (const auto & ev : layer_inp_accum_events) {
-        if (ev.event && ev.pos_end >= p_end && (!best || ev.pos_end < best->pos_end)) {
+        if (!ev.events.empty() && ev.pos_end >= p_end && (!best || ev.pos_end < best->pos_end)) {
             best = &ev;
         }
     }
     if (!best) {
         return false;
     }
-    ggml_backend_event_synchronize(best->event);
+    for (const auto & backend_ev : best->events) {
+        ggml_backend_event_synchronize(backend_ev.event);
+    }
     return true;
 }
 
@@ -1425,7 +1463,51 @@ bool llama_context::layer_inp_accum_ready(llama_pos p_end) {
     // events fire in stream order, so waiting on one means waiting for the
     // device to reach that position, not for a copy to land.
     for (const auto & ev : layer_inp_accum_events) {
-        if (ev.event && ev.pos_end >= p_end && ggml_backend_event_query(ev.event)) {
+        if (!ev.events.empty() && ev.pos_end >= p_end) {
+            bool ready = true;
+            for (const auto & backend_ev : ev.events) {
+                ready = ready && ggml_backend_event_query(backend_ev.event);
+            }
+            if (ready) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool llama_context::layer_inp_accum_wait_epoch(uint64_t epoch) {
+    if (epoch == 0) {
+        return false;
+    }
+    const layer_inp_accum_ev * best = nullptr;
+    for (const auto & ev : layer_inp_accum_events) {
+        if (!ev.events.empty() && ev.epoch >= epoch && (!best || ev.epoch < best->epoch)) {
+            best = &ev;
+        }
+    }
+    if (!best) {
+        return false;
+    }
+    for (const auto & backend_ev : best->events) {
+        ggml_backend_event_synchronize(backend_ev.event);
+    }
+    return true;
+}
+
+bool llama_context::layer_inp_accum_ready_epoch(uint64_t epoch) {
+    if (epoch == 0) {
+        return false;
+    }
+    for (const auto & ev : layer_inp_accum_events) {
+        if (ev.events.empty() || ev.epoch < epoch) {
+            continue;
+        }
+        bool ready = true;
+        for (const auto & backend_ev : ev.events) {
+            ready = ready && ggml_backend_event_query(backend_ev.event);
+        }
+        if (ready) {
             return true;
         }
     }
@@ -2546,27 +2628,57 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, const llama_ubatch & ubatch) {
     const size_t n_tokens = ubatch.n_tokens;
 
-    // Position-indexed accum: valid only for single-seq ubatches with sequential
-    // positions (holds for prefill). Multi-seq batches would collide in the shared
-    // position space, so they skip the accum and the consumer falls back to the
-    // per-batch buffers. Small (decode/verify) ubatches are also skipped - the
-    // consumer only reads prompt-sized chunks from the accum, and writing here
-    // would tick the ring-drain counter and cost stray synchronizes during decode.
-    // Small (verify-sized) ubatches used to be excluded here so they would not
-    // tick the ring-drain counter. The tap is event-ordered now, so they can
-    // record a readiness event too - that lets a consumer wait on the tap
-    // instead of a full llama_synchronize, which during generation costs 5ms a
-    // token waiting on every backend rather than the one that has the rows.
+    // Position-indexed accum, partitioned by sequence. Build contiguous source
+    // runs once and reuse them for every tapped layer. The common single-request
+    // prefill remains one D2H per layer; combined server batches are split into
+    // sequence runs so identical positions in different slots cannot collide.
     static const int32_t accum_min = []() {
         const char * e = getenv("LLAMA_TAP_ACCUM_MIN");
         return e != nullptr ? atoi(e) : 16;
     }();
-    const bool accum_ok = layer_inp_accum && ubatch.pos && ubatch.n_seqs_unq == 1 &&
-                          (int32_t) n_tokens >= accum_min && ubatch.pos[0] >= 0 &&
-                          (size_t) ubatch.pos[0] + n_tokens <= (size_t) layer_inp_accum_cap;
+
+    struct accum_run {
+        llama_seq_id seq_id;
+        llama_pos    p0;
+        size_t       i0;
+        size_t       n;
+    };
+    std::vector<accum_run> accum_runs;
+
+    bool accum_ok = layer_inp_accum && ubatch.pos && ubatch.n_pos == 1 &&
+                    (int32_t) n_tokens >= accum_min;
+    for (size_t i = 0; accum_ok && i < n_tokens; ++i) {
+        const llama_pos pos = ubatch.pos[i];
+        if (pos < 0 || pos >= layer_inp_accum_cap || ubatch.n_seq_id[i] <= 0) {
+            accum_ok = false;
+            break;
+        }
+
+        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+            const llama_seq_id seq_id = ubatch.seq_id[i][j];
+            if (seq_id < 0 || seq_id >= layer_inp_accum_n_seq) {
+                accum_ok = false;
+                break;
+            }
+
+            if (ubatch.n_seq_id[i] == 1 && !accum_runs.empty()) {
+                auto & last = accum_runs.back();
+                if (last.seq_id == seq_id && last.i0 + last.n == i && last.p0 + (llama_pos) last.n == pos) {
+                    last.n++;
+                    continue;
+                }
+            }
+            accum_runs.push_back({seq_id, pos, i, 1});
+        }
+    }
+    if (!accum_ok) {
+        accum_runs.clear();
+    }
+
     bool accum_wrote = false;
+    bool accum_complete = accum_ok;
     bool taps_static = true;
-    ggml_backend_t accum_backend = nullptr;
+    std::vector<ggml_backend_t> accum_backends;
 
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
@@ -2593,17 +2705,27 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         GGML_ASSERT(backend != nullptr);
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
 
-        if (accum_ok && layer_inp_accum_idx[il] >= 0 && row_floats == model.hparams.n_embd) {
-            float * dst = layer_inp_accum +
-                ((size_t) layer_inp_accum_idx[il] * layer_inp_accum_cap + ubatch.pos[0]) * row_floats;
-            ggml_backend_tensor_get_async(backend, t, dst, 0, nbytes);
+        const bool layer_accum_ok = accum_ok && layer_inp_accum_idx[il] >= 0 &&
+                                    row_floats == model.hparams.n_embd;
+        if (layer_accum_ok) {
+            const size_t row_bytes = row_floats * sizeof(float);
+            for (const auto & run : accum_runs) {
+                const size_t region_seq =
+                    (size_t) layer_inp_accum_idx[il] * layer_inp_accum_n_seq + run.seq_id;
+                float * dst = layer_inp_accum +
+                    (region_seq * layer_inp_accum_cap + run.p0) * row_floats;
+                ggml_backend_tensor_get_async(backend, t, dst, run.i0 * row_bytes, run.n * row_bytes);
+            }
             accum_wrote = true;
-            accum_backend = backend;
+            if (std::find(accum_backends.begin(), accum_backends.end(), backend) == accum_backends.end()) {
+                accum_backends.push_back(backend);
+            }
             if (il >= layer_inp_dev.size() || layer_inp_dev[il] == nullptr) {
                 taps_static = false;
             }
+        } else if (accum_ok) {
+            accum_complete = false;
         }
-
     }
 
     // The accum extracts read straight from the scheduler's rotating compute buffers.
@@ -2611,29 +2733,62 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
     // slot's buffer, so an async D2H that has not drained by then would read clobbered
     // data. Bound the in-flight extracts to the ring size, same as the pre-norm accum.
     if (accum_wrote) {
-        // Record a readiness event after this ubatch's copies: once it fires, every
-        // accum row below pos[0] + n_tokens is on the host. Lets the DFlash hook
-        // gather a finished chunk without a full synchronize that would also wait
-        // for the chunks still computing behind it.
+        // Record one event per backend participating in the tap extraction. A
+        // readiness epoch is published only after all tapped layers have queued
+        // their copies, so a deferred consumer never observes a partially filled row.
         if (layer_inp_accum_events.empty()) {
-            ggml_backend_dev_t dev = ggml_backend_get_device(accum_backend);
-            if (dev) {
-                layer_inp_accum_events.resize(4);
-                for (auto & ev : layer_inp_accum_events) {
-                    ev.event = ggml_backend_event_new(dev);
-                }
-            }
+            layer_inp_accum_events.resize(4);
         }
         if (!layer_inp_accum_events.empty()) {
             auto & ev = layer_inp_accum_events[layer_inp_accum_ev_next];
             layer_inp_accum_ev_next = (layer_inp_accum_ev_next + 1) % layer_inp_accum_events.size();
-            if (ev.event) {
+
+            bool same_backends = ev.events.size() == accum_backends.size();
+            for (size_t i = 0; same_backends && i < accum_backends.size(); ++i) {
+                same_backends = ev.events[i].backend == accum_backends[i];
+            }
+            if (!same_backends) {
+                for (auto & backend_ev : ev.events) {
+                    if (backend_ev.event) {
+                        ggml_backend_event_synchronize(backend_ev.event);
+                        ggml_backend_event_free(backend_ev.event);
+                    }
+                }
+                ev.events.clear();
+                for (ggml_backend_t backend : accum_backends) {
+                    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+                    ggml_backend_event_t event = dev ? ggml_backend_event_new(dev) : nullptr;
+                    if (!event) {
+                        for (auto & backend_ev : ev.events) {
+                            ggml_backend_event_free(backend_ev.event);
+                        }
+                        ev.events.clear();
+                        break;
+                    }
+                    ev.events.push_back({backend, event});
+                }
+            }
+
+            if (!ev.events.empty()) {
                 ev.pos_end = -1;
-                ggml_backend_event_record(ev.event, accum_backend);
-                ev.pos_end = ubatch.pos[0] + (llama_pos) n_tokens;
+                ev.epoch   = ++layer_inp_accum_epoch;
+                for (auto & backend_ev : ev.events) {
+                    ggml_backend_event_record(backend_ev.event, backend_ev.backend);
+                }
+
+                if (accum_complete) {
+                    for (const auto & run : accum_runs) {
+                        const size_t row = (size_t) run.seq_id * layer_inp_accum_cap + run.p0;
+                        std::fill_n(layer_inp_accum_row_epoch.begin() + row, run.n, ev.epoch);
+                        if (run.seq_id == 0) {
+                            ev.pos_end = std::max(ev.pos_end, run.p0 + (llama_pos) run.n);
+                        }
+                    }
+                }
+
                 if (taps_static) {
-                    tap_readback_event   = ev.event;
-                    tap_readback_backend = accum_backend;
+                    tap_readback_event   = ev.events.back().event;
+                    tap_readback_backend = ev.events.back().backend;
                 }
             }
         }
@@ -4153,6 +4308,24 @@ float * llama_set_embeddings_layer_inp_accum(llama_context * ctx, int32_t n_toke
 
 const float * llama_get_embeddings_layer_inp_accum(llama_context * ctx, uint32_t lid) {
     return ctx->get_embeddings_layer_inp_accum(lid);
+}
+
+const float * llama_get_embeddings_layer_inp_accum_seq(
+        llama_context * ctx, uint32_t lid, llama_seq_id seq_id) {
+    return ctx->get_embeddings_layer_inp_accum_seq(lid, seq_id);
+}
+
+uint64_t llama_layer_inp_accum_span_epoch(
+        llama_context * ctx, llama_seq_id seq_id, llama_pos p0, int32_t n_tokens) {
+    return ctx->layer_inp_accum_span_epoch(seq_id, p0, n_tokens);
+}
+
+bool llama_layer_inp_accum_wait_epoch(llama_context * ctx, uint64_t epoch) {
+    return ctx->layer_inp_accum_wait_epoch(epoch);
+}
+
+bool llama_layer_inp_accum_ready_epoch(llama_context * ctx, uint64_t epoch) {
+    return ctx->layer_inp_accum_ready_epoch(epoch);
 }
 
 bool llama_layer_inp_accum_wait(llama_context * ctx, llama_pos p_end) {
