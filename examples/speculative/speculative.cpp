@@ -181,10 +181,33 @@ int main(int argc, char ** argv) {
 
     const auto t_enc_start = ggml_time_us();
 
-    // eval the prompt with both models
-    llama_decode(ctx_tgt, llama_batch_get_one( inp.data(), n_input - 1));
-    llama_decode(ctx_tgt, llama_batch_get_one(&inp.back(),           1));
-    llama_decode(ctx_dft, llama_batch_get_one( inp.data(), n_input));
+    // Evaluate prompts in batches. A prompt may fit the context while exceeding
+    // n_batch; submitting it as one decode used to trip llama_context's batch-size
+    // assertion. Keep the target's final token separate so its sampling output is
+    // unambiguous, matching the original two-call behavior.
+    auto decode_prompt = [](llama_context * ctx, llama_token * tokens, int32_t n_tokens,
+                            bool keep_last_separate) -> bool {
+        const int32_t n_batch  = (int32_t) llama_n_batch(ctx);
+        const int32_t n_prefix = keep_last_separate ? std::max(0, n_tokens - 1) : n_tokens;
+
+        for (int32_t offset = 0; offset < n_prefix; offset += n_batch) {
+            const int32_t count = std::min(n_batch, n_prefix - offset);
+            if (llama_decode(ctx, llama_batch_get_one(tokens + offset, count)) != 0) {
+                return false;
+            }
+        }
+        if (keep_last_separate && n_tokens > 0 &&
+                llama_decode(ctx, llama_batch_get_one(tokens + n_tokens - 1, 1)) != 0) {
+            return false;
+        }
+        return true;
+    };
+
+    if (!decode_prompt(ctx_tgt, inp.data(), n_input, true) ||
+        !decode_prompt(ctx_dft, inp.data(), n_input, false)) {
+        LOG_ERR("%s: failed to decode the prompt\n", __func__);
+        return 1;
+    }
 
     const auto t_enc_end = ggml_time_us();
 
