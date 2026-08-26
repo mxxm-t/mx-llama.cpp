@@ -1075,7 +1075,8 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_MINIMAX_M3:
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_KIMI_LINEAR:
-        case LLM_ARCH_BAILINGMOE3:
+        // BAILINGMOE3 is deliberately absent: the fork runs it under -sm tensor via
+        // llm_arch_sm_tensor_replicates_attention (design A). Do not re-add it.
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_QWEN3TTS:
             return false;
@@ -1091,6 +1092,13 @@ bool llm_arch_sm_tensor_replicates_attention(const llm_arch & arch) {
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
+        // bailingmoe3 pairs the same single-latent MLA attention with gated-delta-net
+        // layers whose conv/recurrent state cannot be row-split either, so everything
+        // except the routed experts mirrors per lane. The generic ffn(_exps)/shexp
+        // patterns already cover its MoE tensor names, and the router (ffn_gate_inp)
+        // falls through to the mirrored default, keeping expert selection
+        // bit-identical across lanes.
+        case LLM_ARCH_BAILINGMOE3:
             return true;
         default:
             return false;
