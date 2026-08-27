@@ -8,7 +8,6 @@ struct __builtin_align__(32) float8 {
     float x; float y; float z; float w;
     float p; float q; float r; float s;
 };
-#endif
 
 #if CUDART_VERSION >= 12080
 static __device__ __forceinline__ float nvfp4_native_scale_error(
@@ -49,6 +48,7 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
     return err;
 }
 #endif // CUDART_VERSION >= 12080
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
 
 template <int block_size>
 __launch_bounds__(block_size, 1)

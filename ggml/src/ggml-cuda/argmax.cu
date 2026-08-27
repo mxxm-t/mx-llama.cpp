@@ -9,7 +9,9 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
     const int64_t row = blockIdx.x;
 
     float maxval = -FLT_MAX;
-    int   argmax = -1;
+    // 0, not -1: NaN comparisons never update the running max, so an all-NaN row
+    // would otherwise return -1 - which downstream gathers use as a row index
+    int   argmax = 0;
     const float * rowx = x + row * ncols;
 
     for (int32_t col = threadIdx.x; col < ncols; col += blockDim.x) {

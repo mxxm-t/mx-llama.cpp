@@ -1,4 +1,5 @@
 #include "gated_delta_net.cuh"
+#include "gated_delta_net_chunk.cuh"
 #include "ggml-cuda/common.cuh"
 
 template <int S_v, bool KDA, bool keep_rs_t>
@@ -177,7 +178,19 @@ static void launch_gated_delta_net(
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
         float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
-    //TODO: Add chunked kernel for even faster pre-fill
+    const int CS = KDA ? 16 : 64;
+
+    if constexpr (!keep_rs_t) {
+        if (n_tokens >= 2 * CS && S_v <= 128) {
+            launch_gated_delta_net_chunk<KDA, keep_rs_t>(
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3,
+                sv1, sv2, sv3, sb1, sb2, sb3,
+                neqk1, rq3, scale, K, stream);
+            return;
+        }
+    } 
+
     const int device = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
     const int cc = ggml_cuda_info().devices[device].cc;

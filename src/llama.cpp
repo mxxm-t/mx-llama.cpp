@@ -48,6 +48,8 @@ const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_ty
 
 const char * llama_load_mode_name(enum llama_load_mode load_mode) {
     switch (load_mode) {
+        case LLAMA_LOAD_MODE_AUTO:
+            return "auto";
         case LLAMA_LOAD_MODE_NONE:
             return "none";
         case LLAMA_LOAD_MODE_MMAP:
@@ -63,11 +65,12 @@ const char * llama_load_mode_name(enum llama_load_mode load_mode) {
 }
 
 enum llama_load_mode llama_load_mode_from_str(const char * str) {
-    if (std::strcmp(str, "none") == 0)       { return LLAMA_LOAD_MODE_NONE;       }
-    if (std::strcmp(str, "mmap") == 0)       { return LLAMA_LOAD_MODE_MMAP;       }
-    if (std::strcmp(str, "mlock") == 0)      { return LLAMA_LOAD_MODE_MLOCK;      }
+    if (std::strcmp(str, "auto")       == 0) { return LLAMA_LOAD_MODE_AUTO;       }
+    if (std::strcmp(str, "none")       == 0) { return LLAMA_LOAD_MODE_NONE;       }
+    if (std::strcmp(str, "mmap")       == 0) { return LLAMA_LOAD_MODE_MMAP;       }
+    if (std::strcmp(str, "mlock")      == 0) { return LLAMA_LOAD_MODE_MLOCK;      }
     if (std::strcmp(str, "mmap+mlock") == 0) { return LLAMA_LOAD_MODE_MMAP_MLOCK; }
-    if (std::strcmp(str, "dio") == 0)        { return LLAMA_LOAD_MODE_DIRECT_IO;  }
+    if (std::strcmp(str, "dio")        == 0) { return LLAMA_LOAD_MODE_DIRECT_IO;  }
     throw std::invalid_argument(std::string("unknown load mode: ") + str);
 }
 
@@ -111,6 +114,10 @@ bool llama_supports_rpc(void) {
     return ggml_backend_reg_by_name("RPC") != nullptr;
 }
 
+const char * llama_version(void) {
+    return LLAMA_VERSION;
+}
+
 void llama_backend_init(void) {
     ggml_time_init();
 
@@ -147,7 +154,37 @@ int64_t llama_time_us(void) {
 }
 
 // returns true on success
-static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
+static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model, uint32_t tps_auto_divisor) {
+    // A DSV4-backbone drafter prefers a single group over a SUBSET of the devices to a
+    // multi-stage split over all of them: the draft chain is serial, so every pipeline
+    // stage costs it a cross-device hop per drafted token, while the subset keeps the
+    // whole drafter one hop-free group and leaves the remaining devices to the target.
+    // Returns the device count the draft should use (n_devs when no subset applies).
+    auto draft_subset_devs = [&](size_t n_devs) -> size_t {
+        if (tps_auto_divisor == 0) {
+            return n_devs;
+        }
+        const int32_t tps_param = params.tensor_parallel_size;
+        if (tps_param > 0) {
+            // an explicit -tpsd that does not divide the device count is a subset request
+            return (size_t) tps_param <= n_devs && n_devs % (size_t) tps_param != 0 ?
+                   (size_t) tps_param : n_devs;
+        }
+        size_t width = 0;
+        for (size_t c = std::min((size_t) tps_auto_divisor, n_devs); c >= 1; c--) {
+            if (tps_auto_divisor % c == 0) {
+                width = c;
+                break;
+            }
+        }
+        if (width > 0 && width < n_devs) {
+            LLAMA_LOG_WARN("%s: draft uses a single TP group over the first %zu of %zu devices, "
+                    "keeping the serial draft chain in one hop-free group\n",
+                    __func__, width, n_devs);
+            return width;
+        }
+        return n_devs;
+    };
     // Validate -tps / tensor_parallel_size against the device count. Returns the resolved tps
     // (0 / equal-to-n_devs both mean "single TP group covering all devs"); negative on error.
     auto resolve_tps = [&](size_t n_devs) -> int64_t {
@@ -181,6 +218,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
                 return false;
             }
+            n_devs = draft_subset_devs(n_devs);
             const int64_t tps = resolve_tps(n_devs);
             if (tps < 0) {
                 return false;
@@ -227,6 +265,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 return false;
             }
 
+            devs.resize(draft_subset_devs(devs.size()));
             const int64_t tps = resolve_tps(devs.size());
             if (tps < 0) {
                 return false;
@@ -286,7 +325,11 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                     }
 
                     case GGML_BACKEND_DEVICE_TYPE_IGPU:
-                        if (igpus.empty()) {
+                        // igpus.empty() - workaround for integrated devices seen by multiple backends
+                        // ref: https://github.com/ggml-org/llama.cpp/pull/23897
+                        // ggml_backend_dev_backend_reg - allow devices of the same backend regardless if integrated
+                        // ref: https://github.com/ggml-org/llama.cpp/pull/23897#issuecomment-5264222997
+                        if (igpus.empty() || ggml_backend_dev_backend_reg(dev) == ggml_backend_dev_backend_reg(igpus.back().dev)) {
                             igpus.push_back({false, dev});
                         }
                         break;
@@ -346,7 +389,19 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
 
-        bool ok = llama_prepare_model_devices(params, model_ptr.get());
+        // A DFlash drafter with a DSV4 backbone constrains which TP group widths can
+        // split it (see the head-split rules in llama-model.cpp). Read the constraint
+        // before the Meta device is created so an auto (tpsd=0) width can honor it.
+        uint32_t tps_auto_divisor = 0;
+        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && model_ptr->arch == LLM_ARCH_DFLASH) {
+            uint32_t hc_mult = 0;
+            ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hc_mult, false);
+            if (hc_mult > 0) {
+                ml.get_key(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT, tps_auto_divisor, false);
+            }
+        }
+
+        bool ok = llama_prepare_model_devices(params, model_ptr.get(), tps_auto_divisor);
         if (!ok) {
             return {-1, nullptr};
         }

@@ -32,6 +32,14 @@ void ggml_print_backtrace(void);
 
 uint64_t ggml_graph_next_uid(void);
 
+// internal: allocate a graph with the scheduler's current buffer-id
+// assignment so multi-buffer layout-cache restores can be validated, and an
+// ids-changed graph can re-bind from the cache without the reserve drain.
+// Returns false when no matching cached layout exists (caller reserves).
+struct ggml_gallocr;
+bool ggml_gallocr_alloc_graph_ids(struct ggml_gallocr * galloc, struct ggml_cgraph * graph,
+        const int * node_buffer_ids, const int * leaf_buffer_ids);
+
 #ifndef MIN
 #    define MIN(a, b) ((a) < (b) ? (a) : (b))
 #endif

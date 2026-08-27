@@ -61,11 +61,12 @@ static __device__ __forceinline__ void barrier_end(
     __syncthreads();
     uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
     if (threadIdx.x < NRANKS) {
-        *reinterpret_cast<volatile FlagType *>(&sg.signals[threadIdx.x]->end[blockIdx.x][rank]) = flag;
-        FlagType val;
-        do {
-            val = *reinterpret_cast<volatile FlagType *>(&self_sg->end[blockIdx.x][threadIdx.x]);
-        } while (val != flag);
+        // Release/acquire like barrier_start: the flag store must not pass the
+        // preceding payload peer-writes. Hardening - the HIP path always had
+        // this ordering.
+        st_flag_volatile(&sg.signals[threadIdx.x]->end[blockIdx.x][rank], flag);
+        while (ld_flag_volatile(&self_sg->end[blockIdx.x][threadIdx.x]) != flag)
+            ;
     }
     if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
 }
@@ -765,7 +766,7 @@ void tp_custom_ar_destroy(CustomARContext * ctx) {
     ctx->initialized = false;
 }
 
-void tp_custom_ar_prepare(CustomARContext * ctx,
+bool tp_custom_ar_prepare(CustomARContext * ctx,
                           float ** input_ptrs,
                           float ** output_ptrs,
                           int64_t  n_elements,
@@ -796,10 +797,25 @@ void tp_custom_ar_prepare(CustomARContext * ctx,
     // Twoshot needs slice-aligned + float4-aligned data: n_elements % (4*nranks) == 0.
     const bool twoshot_eligible =
         s_broadcast && (n_elements % (int64_t)(4 * nranks) == 0);
-    const int64_t twoshot_min_ne = 262144;               // ~1 MB F32 crossover
+    const int64_t twoshot_legacy_min_ne = 262144;        // ~1 MB F32 crossover
+    // Decode A/B on gfx906 selects two-shot for ranks where its reduced peer
+    // traffic pays for the second phase. Four-rank communicators cross over
+    // only when they are pipeline stages; standalone TP4 remains broadcast.
+    const bool auto_small_twoshot =
+        nranks == 5 || nranks == 8 || nranks == 10 ||
+        (nranks == 4 && ctx->prefer_small_twoshot);
+    const int64_t twoshot_min_ne = auto_small_twoshot ? 1 : twoshot_legacy_min_ne;
     const bool s_twoshot =
         twoshot_eligible &&
         (s_twoshot_env == 1 || (s_twoshot_env == -1 && n_elements >= twoshot_min_ne));
+    if (s_twoshot && s_twoshot_env == -1 && n_elements < twoshot_legacy_min_ne) {
+        if (!ctx->logged_small_twoshot) {
+            ctx->logged_small_twoshot = true;
+            fprintf(stderr,
+                    "TP custom AllReduce: auto-selected two-shot for %d-rank decode-sized tensors\n",
+                    nranks);
+        }
+    }
 
     const size_t bytes_f32 = (size_t) n_elements * sizeof(float);
     // Broadcast path: F32 staging, N slots per rank (one inbox per peer + unused self slot).
@@ -820,13 +836,32 @@ void tp_custom_ar_prepare(CustomARContext * ctx,
 #endif
                 ctx->d_staging[rank] = nullptr;
             }
-#if defined(GGML_USE_HIP)
             void * ptr = nullptr;
-            CUDA_CHECK(hipExtMallocWithFlags(&ptr, need_bytes, hipDeviceMallocFinegrained));
-            ctx->d_staging[rank] = (float *) ptr;
+#if defined(GGML_USE_HIP)
+            const cudaError_t err = hipExtMallocWithFlags(&ptr, need_bytes, hipDeviceMallocFinegrained);
 #else
-            CUDA_CHECK(cudaMalloc(&ctx->d_staging[rank], need_bytes));
+            const cudaError_t err = cudaMalloc(&ptr, need_bytes);
 #endif
+            if (err == cudaErrorMemoryAllocation) {
+                (void) cudaGetLastError();
+                GGML_LOG_WARN("TP custom AR: could not allocate %.2f MiB staging on device %d; "
+                              "falling back to the regular AllReduce path\n",
+                              need_bytes / (1024.0 * 1024.0), ctx->dev_ids[rank]);
+                for (int cleanup_rank = 0; cleanup_rank < ctx->nranks; cleanup_rank++) {
+                    ggml_cuda_set_device(ctx->dev_ids[cleanup_rank]);
+                    if (ctx->d_staging[cleanup_rank] != nullptr) {
+                        CUDA_CHECK(cudaFree(ctx->d_staging[cleanup_rank]));
+                        ctx->d_staging[cleanup_rank] = nullptr;
+                    }
+                    ctx->cached_ptrs[cleanup_rank] = nullptr;
+                }
+                ctx->staging_size  = 0;
+                ctx->staging_slots = 0;
+                *plan = {};
+                return false;
+            }
+            CUDA_CHECK(err);
+            ctx->d_staging[rank] = (float *) ptr;
         }
         ctx->staging_size  = need_bytes;
         ctx->staging_slots = need_slots;
@@ -917,6 +952,7 @@ void tp_custom_ar_prepare(CustomARContext * ctx,
         plan->outputs[rank] = output_ptrs[rank];
         plan->streams[rank] = streams    [rank];
     }
+    return true;
 }
 
 void tp_custom_ar_launch_rank(const CustomARPlan * plan, int rank) {
@@ -965,17 +1001,20 @@ void tp_custom_ar_launch_rank(const CustomARPlan * plan, int rank) {
     dispatch(dispatch, std::integral_constant<int, kMaxRanks>{});
 }
 
-void tp_custom_ar_allreduce(CustomARContext * ctx,
+bool tp_custom_ar_allreduce(CustomARContext * ctx,
                             float ** input_ptrs,
                             float ** output_ptrs,
                             int64_t  n_elements,
                             int      nranks,
                             cudaStream_t * streams) {
     CustomARPlan plan;
-    tp_custom_ar_prepare(ctx, input_ptrs, output_ptrs, n_elements, nranks, streams, &plan);
+    if (!tp_custom_ar_prepare(ctx, input_ptrs, output_ptrs, n_elements, nranks, streams, &plan)) {
+        return false;
+    }
     for (int rank = 0; rank < nranks; rank++) {
         tp_custom_ar_launch_rank(&plan, rank);
     }
+    return true;
 }
 
 } // namespace ggml_cuda_tp

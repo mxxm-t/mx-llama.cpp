@@ -100,6 +100,9 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // whether partial sequence state is safe to use for prompt checkpoints
+    virtual bool get_can_checkpoint() const { return true; }
+
     //
     // ops
     //

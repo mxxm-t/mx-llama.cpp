@@ -639,7 +639,8 @@ template <typename T> struct block_reduce_policy<block_reduce_method::MAX, T> {
 };
 
 template <block_reduce_method reduce_method_t, const unsigned int block_size_template = 0, typename T>
-static __device__ T block_reduce(T val, T * shared_vals) {
+static __device__ T block_reduce(T val, [[maybe_unused]] T * shared_vals) {
+    // for multi-warp reductions, callers must not reuse shared_vals until all reads from this invocation have completed
     val                           = block_reduce_policy<reduce_method_t, T>::reduce(val);
     const unsigned int block_size = block_size_template == 0 ? blockDim.x : block_size_template;
     if (block_size > WARP_SIZE) {
@@ -1179,6 +1180,10 @@ struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
+    // Pools without recovery keep the regular fail-fast behavior.
+    virtual void * try_alloc(size_t size, size_t * actual_size) {
+        return alloc(size, actual_size);
+    }
     virtual void free(void * ptr, size_t size) = 0;
 };
 
@@ -1198,9 +1203,7 @@ struct ggml_cuda_pool_alloc {
     }
 
     ~ggml_cuda_pool_alloc() {
-        if (ptr != nullptr) {
-            pool->free(ptr, actual_size);
-        }
+        reset();
     }
 
     // size is in number of elements
@@ -1214,6 +1217,21 @@ struct ggml_cuda_pool_alloc {
     T * alloc(ggml_cuda_pool & pool, size_t size) {
         this->pool = &pool;
         return alloc(size);
+    }
+
+    T * try_alloc(size_t size) {
+        GGML_ASSERT(pool != nullptr);
+        GGML_ASSERT(ptr == nullptr);
+        ptr = (T *) pool->try_alloc(size * sizeof(T), &this->actual_size);
+        return ptr;
+    }
+
+    void reset() {
+        if (ptr != nullptr) {
+            pool->free(ptr, actual_size);
+            ptr = nullptr;
+            actual_size = 0;
+        }
     }
 
     T * get() {
@@ -1254,9 +1272,18 @@ struct ggml_cuda_graph {
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
+    bool disable_due_to_memory = false;
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
+    // kernel functions of the last capture, to detect function changes that
+    // hipGraphExecUpdate would apply without validating launch geometry
+    std::vector<const void *> kernel_funcs;
+    // graphs never amortize for entries whose properties keep changing
+    // (spec decode churns shapes and KV pointers) - they self-disable
+    int n_prop_checks = 0;
+    int n_prop_resets = 0;
+    bool unstable_disabled = false;
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
@@ -1267,7 +1294,7 @@ struct ggml_cuda_graph {
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
-        return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
+        return !(disable_due_to_gpu_arch || disable_due_to_memory || unstable_disabled || disable_cuda_graphs_due_to_env);
     }
 #endif
 };
@@ -1440,7 +1467,26 @@ struct ggml_backend_cuda_context {
     cudaEvent_t  pp_copy_event_b = nullptr; // pp_copy_stream -> dst main
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
-    cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+
+    // Remember a smaller split flash-attention workspace after an allocation failure.
+    int fattn_parallel_blocks_cap = 0;
+    bool fattn_parallel_blocks_override_logged = false;
+    // Preserve a working row chunk after TOP_K encounters memory pressure. Retrying
+    // the known-too-large allocation in every layer would force a device-wide pool
+    // flush and make deep prefill needlessly expensive.
+    int64_t top_k_workspace_rows_cap = 0;
+    bool top_k_workspace_rows_cap_logged = false;
+    // Maximum MMQ output columns known to fit its quantized-activation workspace.
+    // Zero keeps the original full-width path until actual memory pressure occurs.
+    int64_t mmq_workspace_cols_cap = 0;
+    bool mmq_workspace_cols_cap_logged = false;
+    int64_t mmq_id_workspace_tokens_cap = 0;
+    bool mmq_id_workspace_tokens_cap_logged = false;
+    int64_t repack_workspace_cols_cap = 0;
+    bool repack_workspace_cols_cap_logged = false;
+    cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
+    void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
+    size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
 
 #if defined(GGML_USE_HIP)
     // Pinned-host scratch for set_tensor_2d_async's misaligned-row workaround. See the
@@ -1530,6 +1576,7 @@ struct ggml_backend_cuda_context {
     size_t q8_1_cache_hits   = 0;
     size_t q8_1_cache_misses = 0;
     size_t q8_1_cache_peak   = 0; // most entries alive at once, over the run
+    bool q8_1_cache_pressure_logged = false;
     void q8_1_cache_reset() {
         q8_1_cache.clear();
     }
@@ -1554,17 +1601,22 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
 
-    cublasHandle_t cublas_handle(int device) {
-        if (cublas_handles[device] == nullptr) {
-            ggml_cuda_set_device(device);
-            CUBLAS_CHECK(cublasCreate(&cublas_handles[device]));
-            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device], CUBLAS_TF32_TENSOR_OP_MATH));
-        }
-        return cublas_handles[device];
-    }
-
     cublasHandle_t cublas_handle() {
-        return cublas_handle(device);
+        if (cublas_handles[device][curr_stream_no] == nullptr) {
+            ggml_cuda_set_device(device);
+            CUBLAS_CHECK(cublasCreate(&cublas_handles[device][curr_stream_no]));
+            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no], CUBLAS_TF32_TENSOR_OP_MATH));
+            CUBLAS_CHECK(cublasSetStream(cublas_handles[device][curr_stream_no], stream()));
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
+            if (cublas_workspace_sizes[device] == 0) {
+                const int cc = ggml_cuda_info().devices[device].cc;
+                cublas_workspace_sizes[device] = (cc >= GGML_CUDA_CC_HOPPER) ? 32 * 1024 * 1024 : 4 * 1024 * 1024;
+            }
+            CUDA_CHECK(cudaMalloc(&cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
+            CUBLAS_CHECK(cublasSetWorkspace(cublas_handles[device][curr_stream_no], cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
+#endif
+        }
+        return cublas_handles[device][curr_stream_no];
     }
 
     // pool
@@ -1733,4 +1785,4 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
 char * ggml_cuda_q8_1_cache_acquire(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src1, int variant,
         int64_t ne_padded, int64_t s11, int64_t s12, int64_t s13,
-        size_t nbytes, bool & hit);
+        size_t nbytes, bool & hit, bool * pressure = nullptr);

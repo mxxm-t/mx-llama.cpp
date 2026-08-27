@@ -40,6 +40,7 @@ bool ggml_op_can_inplace(enum ggml_op op) {
         case GGML_OP_SILU_BACK:
         case GGML_OP_RMS_NORM:
         case GGML_OP_RMS_NORM_BACK:
+        case GGML_OP_CLAMP:
         case GGML_OP_SOFT_MAX:
         case GGML_OP_SOFT_MAX_BACK:
             return true;
@@ -478,6 +479,31 @@ struct node_alloc {
     struct tensor_alloc src[GGML_MAX_SRC];
 };
 
+// Cached allocation layout for one graph topology. Keyed by a checksum over
+// the node/leaf op and type sequence - deliberately EXCLUDING shapes, so a
+// prefill chunk graph whose tensors shrink or grow within the reserved slots
+// matches the same layout. A layout reserved from the worst-case reserve
+// graphs therefore fits every runtime chunk of the same topology, which lets
+// ggml_gallocr_alloc_graph succeed without a reserve. That in turn lets the
+// scheduler skip the all-backend drain it must otherwise take before
+// re-binding tensor addresses, keeping consecutive same-topology graphs
+// (prompt chunks, decode steps) in flight together.
+#define GGML_GALLOC_MAX_LAYOUTS 8
+
+struct gallocr_layout {
+    uint64_t key;        // topology checksum, 0 = unused entry
+    uint64_t key_ids;    // checksum of the buffer-id assignment this layout was
+                         // reserved with (0 = unknown). Restoring into a multi-
+                         // buffer scheduler is only safe when the current
+                         // assignment matches, otherwise a slot binds a tensor
+                         // into another device's buffer.
+    int64_t  last_used;  // for LRU eviction
+    struct node_alloc * node_allocs; // [n_nodes]
+    int n_nodes;
+    struct leaf_alloc * leaf_allocs; // [n_leafs]
+    int n_leafs;
+};
+
 struct ggml_gallocr {
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
     struct vbuffer ** buffers; // [n_buffers]
@@ -492,7 +518,111 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    struct gallocr_layout layouts[GGML_GALLOC_MAX_LAYOUTS];
+    int64_t layout_uses;
+    uint64_t active_key_ids; // buffer-id checksum of the active layout (0 = unknown)
 };
+
+static bool ggml_gallocr_layout_cache_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = getenv("GGML_GALLOC_LAYOUT_CACHE");
+        enabled = env == NULL || atoi(env) != 0;
+    }
+    return enabled != 0;
+}
+
+static uint64_t ggml_gallocr_graph_tensor_ordinal(
+        const struct ggml_hash_set * tensors, const uint64_t * ordinals, const struct ggml_tensor * tensor) {
+    if (tensor == NULL) {
+        return 0;
+    }
+    const size_t slot = ggml_hash_find(tensors, tensor);
+    if (slot == GGML_HASHSET_FULL || !ggml_bitset_get(tensors->used, slot)) {
+        return UINT64_MAX;
+    }
+    return ordinals[slot];
+}
+
+// checksum over graph connectivity, ops and types. Floating-point shapes stay
+// excluded so one worst-case prefill layout can serve smaller runtime chunks.
+static uint64_t ggml_gallocr_graph_key(const struct ggml_cgraph * graph) {
+    uint64_t h = 1469598103934665603ULL;
+    const size_t n_tensors = (size_t) graph->n_nodes + (size_t) graph->n_leafs;
+    if (n_tensors == 0) {
+        return h;
+    }
+
+    struct ggml_hash_set tensors = ggml_hash_set_new(n_tensors);
+    uint64_t * ordinals = calloc(tensors.size, sizeof(*ordinals));
+    GGML_ASSERT(ordinals != NULL);
+
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const size_t slot = ggml_hash_find_or_insert(&tensors, graph->nodes[i]);
+        ordinals[slot] = (uint64_t) i + 1;
+    }
+    for (int i = 0; i < graph->n_leafs; i++) {
+        const size_t slot = ggml_hash_find_or_insert(&tensors, graph->leafs[i]);
+        ordinals[slot] = (uint64_t) graph->n_nodes + (uint64_t) i + 1;
+    }
+
+#define GGML_GALLOC_KEY_MIX(v) h = (h ^ (uint64_t)(v)) * 1099511628211ULL
+    GGML_GALLOC_KEY_MIX(graph->n_nodes);
+    GGML_GALLOC_KEY_MIX(graph->n_leafs);
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const struct ggml_tensor * node = graph->nodes[i];
+        GGML_GALLOC_KEY_MIX(node->op);
+        GGML_GALLOC_KEY_MIX(node->type);
+        GGML_GALLOC_KEY_MIX(node->flags);
+        GGML_GALLOC_KEY_MIX(node->view_src != NULL || node->data != NULL);
+        GGML_GALLOC_KEY_MIX(ggml_gallocr_graph_tensor_ordinal(&tensors, ordinals, node->view_src));
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            GGML_GALLOC_KEY_MIX(ggml_gallocr_graph_tensor_ordinal(&tensors, ordinals, node->src[j]));
+        }
+    }
+    for (int i = 0; i < graph->n_leafs; i++) {
+        const struct ggml_tensor * leaf = graph->leafs[i];
+        GGML_GALLOC_KEY_MIX(leaf->op);
+        GGML_GALLOC_KEY_MIX(leaf->type);
+        GGML_GALLOC_KEY_MIX(leaf->flags);
+        GGML_GALLOC_KEY_MIX(leaf->view_src != NULL || leaf->data != NULL);
+        GGML_GALLOC_KEY_MIX(ggml_gallocr_graph_tensor_ordinal(&tensors, ordinals, leaf->view_src));
+        // Integer graph inputs carry row, position and sequence plans. Their
+        // dimensions can change the allocation lifetime topology even when the
+        // op/type sequence is identical (for example, a DSV4 ubatch that first
+        // mixes two server slots). Keep variable-size floating-point masks out
+        // of the key so ordinary long-prefill chunks still share one layout.
+        if ((leaf->flags & GGML_TENSOR_FLAG_INPUT) &&
+                (leaf->type == GGML_TYPE_I32 || leaf->type == GGML_TYPE_I64)) {
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                GGML_GALLOC_KEY_MIX(leaf->ne[d]);
+            }
+        }
+    }
+#undef GGML_GALLOC_KEY_MIX
+    free(ordinals);
+    ggml_hash_set_free(&tensors);
+    return h == 0 ? 1 : h;
+}
+
+// checksum of a buffer-id assignment, mixed per node/leaf in graph order
+static uint64_t ggml_gallocr_ids_key(const struct ggml_cgraph * graph,
+        const int * node_buffer_ids, const int * leaf_buffer_ids) {
+    uint64_t h = 1469598103934665603ULL;
+#define GGML_GALLOC_KEY_MIX(v) h = (h ^ (uint64_t)(v)) * 1099511628211ULL
+    for (int i = 0; i < graph->n_nodes; i++) {
+        GGML_GALLOC_KEY_MIX(node_buffer_ids ? node_buffer_ids[i] : 0);
+    }
+    for (int i = 0; i < graph->n_leafs; i++) {
+        GGML_GALLOC_KEY_MIX(leaf_buffer_ids ? leaf_buffer_ids[i] : 0);
+    }
+#undef GGML_GALLOC_KEY_MIX
+    return h == 0 ? 1 : h;
+}
+
+static void ggml_gallocr_layout_store(ggml_gallocr_t galloc, uint64_t key, uint64_t key_ids);
+static bool ggml_gallocr_layout_restore(ggml_gallocr_t galloc, struct ggml_cgraph * graph, uint64_t key_ids);
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
@@ -575,6 +705,10 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->buf_tallocs);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
+    for (int i = 0; i < GGML_GALLOC_MAX_LAYOUTS; i++) {
+        free(galloc->layouts[i].node_allocs);
+        free(galloc->layouts[i].leaf_allocs);
+    }
     free(galloc);
 }
 
@@ -941,7 +1075,18 @@ static bool ggml_gallocr_reserve_n_impl(
                     return false;
                 }
             }
+
+            // a buffer was replaced: every cached layout's offsets now refer
+            // to freed memory only if the arena SHRANK, which never happens
+            // (chunk sizes are grow-only), so cached layouts stay valid.
         }
+    }
+
+    // cache the freshly reserved layout under the graph's topology key so
+    // later same-topology graphs can re-bind without a reserve
+    if (!no_alloc) {
+        ggml_gallocr_layout_store(galloc, ggml_gallocr_graph_key(graph),
+                ggml_gallocr_ids_key(graph, node_buffer_ids, leaf_buffer_ids));
     }
 
     return true;
@@ -1005,30 +1150,50 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
     return talloc->size_max >= node_size;
 }
 
-static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
-    if (galloc->n_nodes != graph->n_nodes) {
-#ifndef NDEBUG
-        GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
-#endif
-        return true;
+// GGML_ALLOC_REALLOC_TRACE=1 logs the first reason a graph fails the fit
+// check in release builds. Every such failure forces a reallocation, and the
+// scheduler drains ALL backends before reallocating, which serializes any
+// pipeline overlap. Knowing the first offending node is the whole diagnosis.
+static bool ggml_gallocr_realloc_trace(void) {
+    static int flag = -1;
+    if (flag < 0) {
+        const char * env = getenv("GGML_ALLOC_REALLOC_TRACE");
+        flag = env != NULL && atoi(env) != 0;
+    }
+    return flag != 0;
+}
+
+// does the graph fit the given layout (topology-compatible and all slot
+// sizes sufficient)?
+static bool ggml_gallocr_graph_fits(
+        ggml_gallocr_t galloc, struct ggml_cgraph * graph,
+        struct node_alloc * node_allocs, int n_nodes, int n_leafs, bool trace) {
+    if (n_nodes != graph->n_nodes) {
+        if (trace) {
+            GGML_LOG_INFO("[realloc] n_nodes %d -> %d\n", n_nodes, graph->n_nodes);
+        }
+        return false;
     }
 
-    if (galloc->n_leafs != graph->n_leafs) {
-#ifndef NDEBUG
-        GGML_LOG_DEBUG("%s: graph has different number of leafs\n", __func__);
-#endif
-        return true;
+    if (n_leafs != graph->n_leafs) {
+        if (trace) {
+            GGML_LOG_INFO("[realloc] n_leafs %d -> %d\n", n_leafs, graph->n_leafs);
+        }
+        return false;
     }
 
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
-        struct node_alloc * node_alloc = &galloc->node_allocs[i];
+        struct node_alloc * node_alloc = &node_allocs[i];
 
         if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
-#ifndef NDEBUG
-            GGML_LOG_DEBUG("%s: node %s is not valid\n", __func__, node->name);
-#endif
-            return true;
+            if (trace) {
+                GGML_LOG_INFO("[realloc] node %d %s (%s) grew past its slot: size_max=%zu need=%zu\n",
+                        i, node->name, ggml_op_desc(node), node_alloc->dst.size_max,
+                        node->data || node->view_src ? (size_t) 0 :
+                        ggml_backend_buft_get_alloc_size(galloc->bufts[node_alloc->dst.buffer_id >= 0 ? node_alloc->dst.buffer_id : 0], node));
+            }
+            return false;
         }
 
         for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -1037,19 +1202,199 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
                 continue;
             }
             if (!ggml_gallocr_node_needs_realloc(galloc, src, &node_alloc->src[j])) {
-#ifndef NDEBUG
-                GGML_LOG_DEBUG("%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
-#endif
-                return true;
+                if (trace) {
+                    GGML_LOG_INFO("[realloc] src %d (%s) of node %d %s grew past its slot: size_max=%zu\n",
+                            j, src->name, i, node->name, node_alloc->src[j].size_max);
+                }
+                return false;
             }
         }
     }
 
+    return true;
+}
+
+static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    return !ggml_gallocr_graph_fits(galloc, graph, galloc->node_allocs, galloc->n_nodes, galloc->n_leafs,
+            ggml_gallocr_realloc_trace());
+}
+
+// store the active layout into the cache under the graph's topology key plus
+// the buffer-id assignment it was reserved with - same-topology graphs with
+// different assignments (multi-buffer schedulers) get separate slots
+static void ggml_gallocr_layout_store(ggml_gallocr_t galloc, uint64_t key, uint64_t key_ids) {
+    if (!ggml_gallocr_layout_cache_enabled() || key == 0) {
+        return;
+    }
+    galloc->active_key_ids = key_ids;
+
+    struct gallocr_layout * dst = NULL;
+    for (int i = 0; i < GGML_GALLOC_MAX_LAYOUTS; i++) {
+        if (galloc->layouts[i].key == key && galloc->layouts[i].key_ids == key_ids) {
+            dst = &galloc->layouts[i];
+            break;
+        }
+    }
+
+    // never replace a cached layout that fully covers the new one - the
+    // worst-case layouts reserved at context init must survive the smaller
+    // per-chunk reserves that the scheduler's ids-changed path performs, or
+    // later chunks can never fit the cache
+    if (dst != NULL && dst->n_nodes == galloc->n_nodes && dst->n_leafs == galloc->n_leafs) {
+        bool dominated = true;
+        for (int i = 0; i < galloc->n_nodes && dominated; i++) {
+            const struct node_alloc * a = &dst->node_allocs[i];
+            const struct node_alloc * b = &galloc->node_allocs[i];
+            if (a->dst.size_max < b->dst.size_max) {
+                dominated = false;
+            }
+            for (int j = 0; j < GGML_MAX_SRC && dominated; j++) {
+                if (a->src[j].size_max < b->src[j].size_max) {
+                    dominated = false;
+                }
+            }
+        }
+        for (int i = 0; i < galloc->n_leafs && dominated; i++) {
+            if (dst->leaf_allocs[i].leaf.size_max < galloc->leaf_allocs[i].leaf.size_max) {
+                dominated = false;
+            }
+        }
+        if (dominated) {
+            dst->last_used = ++galloc->layout_uses;
+            if (ggml_gallocr_realloc_trace()) {
+                GGML_LOG_INFO("[realloc] layout store skipped, cached layout dominates (key=%016llx)\n",
+                        (unsigned long long) key);
+            }
+            return;
+        }
+    }
+    if (dst == NULL) {
+        for (int i = 0; i < GGML_GALLOC_MAX_LAYOUTS; i++) {
+            if (galloc->layouts[i].key == 0) {
+                dst = &galloc->layouts[i];
+                break;
+            }
+        }
+    }
+    if (dst == NULL) {
+        dst = &galloc->layouts[0];
+        for (int i = 1; i < GGML_GALLOC_MAX_LAYOUTS; i++) {
+            if (galloc->layouts[i].last_used < dst->last_used) {
+                dst = &galloc->layouts[i];
+            }
+        }
+    }
+
+    if (dst->n_nodes < galloc->n_nodes) {
+        free(dst->node_allocs);
+        dst->node_allocs = calloc(galloc->n_nodes, sizeof(struct node_alloc));
+        GGML_ASSERT(dst->node_allocs != NULL);
+    }
+    if (dst->n_leafs < galloc->n_leafs) {
+        free(dst->leaf_allocs);
+        dst->leaf_allocs = calloc(galloc->n_leafs, sizeof(struct leaf_alloc));
+        GGML_ASSERT(dst->leaf_allocs != NULL);
+    }
+    memcpy(dst->node_allocs, galloc->node_allocs, galloc->n_nodes*sizeof(struct node_alloc));
+    memcpy(dst->leaf_allocs, galloc->leaf_allocs, galloc->n_leafs*sizeof(struct leaf_alloc));
+    dst->n_nodes   = galloc->n_nodes;
+    dst->n_leafs   = galloc->n_leafs;
+    dst->key       = key;
+    dst->key_ids   = key_ids;
+    dst->last_used = ++galloc->layout_uses;
+
+    if (ggml_gallocr_realloc_trace()) {
+        GGML_LOG_INFO("[realloc] layout store key=%016llx n_nodes=%d n_leafs=%d\n",
+                (unsigned long long) key, dst->n_nodes, dst->n_leafs);
+    }
+}
+
+// try to satisfy the graph from a cached layout - on hit the cached layout
+// becomes the active allocation and no reserve (hence no scheduler drain)
+// is needed
+static bool ggml_gallocr_layout_restore(ggml_gallocr_t galloc, struct ggml_cgraph * graph, uint64_t key_ids) {
+    if (!ggml_gallocr_layout_cache_enabled()) {
+        return false;
+    }
+
+    // With many per-device buffers (-sm layer) a cached slot's buffer
+    // assignment can disagree with the current split assignment, which binds
+    // tensors into the wrong device's buffer - observed as illegal memory
+    // access. Restoring there requires the caller to supply the current
+    // assignment's checksum (key_ids != 0) so only an exactly-matching layout
+    // is adopted. The two-buffer case (CPU plus one device or meta backend)
+    // cannot disagree and stays valid without it.
+    if (galloc->n_buffers > 2 && key_ids == 0) {
+        return false;
+    }
+
+    const uint64_t key = ggml_gallocr_graph_key(graph);
+    const bool trace = ggml_gallocr_realloc_trace();
+    for (int i = 0; i < GGML_GALLOC_MAX_LAYOUTS; i++) {
+        struct gallocr_layout * lay = &galloc->layouts[i];
+        if (lay->key != key) {
+            continue;
+        }
+        if (key_ids != 0 && lay->key_ids != key_ids) {
+            continue;
+        }
+        if (!ggml_gallocr_graph_fits(galloc, graph, lay->node_allocs, lay->n_nodes, lay->n_leafs, trace)) {
+            if (trace) {
+                GGML_LOG_INFO("[realloc] layout key=%016llx matched but graph does not fit\n",
+                        (unsigned long long) key);
+            }
+            return false;
+        }
+
+        if (galloc->n_nodes < lay->n_nodes) {
+            free(galloc->node_allocs);
+            galloc->node_allocs = calloc(lay->n_nodes, sizeof(struct node_alloc));
+            GGML_ASSERT(galloc->node_allocs != NULL);
+        }
+        if (galloc->n_leafs < lay->n_leafs) {
+            free(galloc->leaf_allocs);
+            galloc->leaf_allocs = calloc(lay->n_leafs, sizeof(struct leaf_alloc));
+            GGML_ASSERT(galloc->leaf_allocs != NULL);
+        }
+        memcpy(galloc->node_allocs, lay->node_allocs, lay->n_nodes*sizeof(struct node_alloc));
+        memcpy(galloc->leaf_allocs, lay->leaf_allocs, lay->n_leafs*sizeof(struct leaf_alloc));
+        galloc->n_nodes = lay->n_nodes;
+        galloc->n_leafs = lay->n_leafs;
+        galloc->active_key_ids = lay->key_ids;
+        lay->last_used  = ++galloc->layout_uses;
+
+        if (trace) {
+            GGML_LOG_INFO("[realloc] layout cache hit (key %016llx)\n", (unsigned long long) key);
+        }
+        return true;
+    }
+    if (trace) {
+        GGML_LOG_INFO("[realloc] no layout for key=%016llx (graph n_nodes=%d n_leafs=%d)\n",
+                (unsigned long long) key, graph->n_nodes, graph->n_leafs);
+    }
     return false;
 }
 
+// internal (declared in ggml-impl.h): allocate with the scheduler's current
+// buffer-id assignment. Restores from the layout cache are then valid for
+// any buffer count, and an ids-changed graph can re-bind without the reserve
+// drain when an exactly-matching layout is cached. Returns false when no
+// matching layout exists - the caller then reserves as before.
+bool ggml_gallocr_alloc_graph_ids(ggml_gallocr_t galloc, struct ggml_cgraph * graph,
+        const int * node_buffer_ids, const int * leaf_buffer_ids) {
+    const uint64_t key_ids = ggml_gallocr_ids_key(graph, node_buffer_ids, leaf_buffer_ids);
+    if (galloc->active_key_ids != key_ids || ggml_gallocr_needs_realloc(galloc, graph)) {
+        // the active layout is for a different assignment or does not fit -
+        // only an ids-matching cached layout may be adopted
+        if (!ggml_gallocr_layout_restore(galloc, graph, key_ids)) {
+            return false;
+        }
+    }
+    return ggml_gallocr_alloc_graph(galloc, graph);
+}
+
 bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
-    if (ggml_gallocr_needs_realloc(galloc, graph)) {
+    if (ggml_gallocr_needs_realloc(galloc, graph) && !ggml_gallocr_layout_restore(galloc, graph, 0)) {
         if (galloc->n_buffers == 1) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: reallocating buffers automatically\n", __func__);

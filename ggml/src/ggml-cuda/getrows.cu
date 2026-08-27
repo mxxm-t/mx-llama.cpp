@@ -2,6 +2,8 @@
 #include "dequantize.cuh"
 #include "convert.cuh"
 
+#include <vector>
+
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
@@ -453,6 +455,25 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
+
+    // GGML_CUDA_GETROWS_CHECK=1: pull the row indices to the host and report any
+    // out-of-bounds value with its position before launching the gather. Costs a
+    // sync per get_rows - diagnostic only.
+    {
+        static const bool check = getenv("GGML_CUDA_GETROWS_CHECK") != nullptr;
+        if (check && ggml_is_contiguous(src1)) {
+            const int64_t n_idx = ggml_nelements(src1);
+            std::vector<int32_t> idx(n_idx);
+            CUDA_CHECK(cudaMemcpyAsync(idx.data(), src1->data, n_idx*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            for (int64_t i = 0; i < n_idx; ++i) {
+                if (idx[i] < 0 || idx[i] >= src0->ne[1]) {
+                    GGML_LOG_ERROR("get_rows OOB: dst=%s src0=%s [%ld x %ld] src1=%s idx[%ld] = %d\n",
+                            dst->name, src0->name, src0->ne[0], src0->ne[1], src1->name, i, idx[i]);
+                }
+            }
+        }
+    }
 
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
         ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
