@@ -1692,6 +1692,37 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<common_sampler_ptr> smpls;
 
+    // the subset of the target's sampling knobs that we mirror into the draft head. cached per
+    // sequence so the sampler is rebuilt only when a request actually changes them.
+    struct draft_sampling_key {
+        bool    valid             = false;
+        float   temp              = 0.0f;
+        float   dynatemp_range    = 0.0f;
+        float   dynatemp_exponent = 0.0f;
+        int32_t top_k             = 0;
+        int32_t min_keep          = 0;
+        float   top_p             = 0.0f;
+        float   min_p             = 0.0f;
+        float   top_n_sigma       = 0.0f;
+        float   typ_p             = 0.0f;
+
+        bool operator==(const draft_sampling_key & o) const {
+            return valid             == o.valid             &&
+                   temp              == o.temp              &&
+                   dynatemp_range    == o.dynatemp_range    &&
+                   dynatemp_exponent == o.dynatemp_exponent &&
+                   top_k             == o.top_k             &&
+                   min_keep          == o.min_keep          &&
+                   top_p             == o.top_p             &&
+                   min_p             == o.min_p             &&
+                   top_n_sigma       == o.top_n_sigma       &&
+                   typ_p             == o.typ_p;
+        }
+    };
+
+    std::vector<draft_sampling_key> smpl_keys;
+    std::vector<char>               smpl_greedy;  // 1 when the target is greedy for this sequence
+
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
 
@@ -1797,6 +1828,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
+
+        // matches the samplers just built: an invalid (no target params) key, non-greedy
+        smpl_keys.assign(n_seq, draft_sampling_key());
+        smpl_greedy.assign(n_seq, 0);
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
@@ -2165,6 +2200,80 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return process_decode(n_tokens, batch_in.token, batch_in.pos, seq_scratch.data(), nullptr);
     }
 
+    // the target picks a single token deterministically, so the draft should too
+    static bool sampling_is_greedy(const common_params_sampling & sp) {
+        return (sp.temp <= 0.0f || sp.top_k == 1) && sp.dynatemp_range == 0.0f;
+    }
+
+    // rebuild this sequence's draft sampler if the target's sampling settings changed
+    void update_draft_sampler(llama_seq_id seq_id, const common_params_sampling * tgt) {
+        draft_sampling_key key;
+
+        if (tgt) {
+            key.valid             = true;
+            key.temp              = tgt->temp;
+            key.dynatemp_range    = tgt->dynatemp_range;
+            key.dynatemp_exponent = tgt->dynatemp_exponent;
+            key.top_k             = tgt->top_k;
+            key.min_keep          = tgt->min_keep;
+            key.top_p             = tgt->top_p;
+            key.min_p             = tgt->min_p;
+            key.top_n_sigma       = tgt->top_n_sigma;
+            key.typ_p             = tgt->typ_p;
+        }
+
+        if (smpl_keys[seq_id] == key) {
+            return;
+        }
+
+        smpl_keys[seq_id] = key;
+
+        const bool greedy = tgt && sampling_is_greedy(*tgt);
+
+        smpl_greedy[seq_id] = greedy ? 1 : 0;
+
+        common_params_sampling sparams;
+        sparams.no_perf = false;
+
+        if (!tgt || greedy) {
+            // unchanged behaviour: the head's own top-10, and the proposal is its argmax
+            sparams.top_k    = 10;
+            sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+        } else {
+            // mirror the target's truncation and temperature so that the proposal distribution q
+            // stays close to the target's p - a flatter q means fewer accepted tokens. penalties,
+            // DRY, XTC, logit bias, grammar and the reasoning budget are deliberately not mirrored:
+            // they depend on state the head does not have, and getting q slightly wrong only costs
+            // acceptance rate, never correctness.
+            const int32_t top_k_req = tgt->top_k > 0 ? tgt->top_k : 64;  // <= 0 means the full vocab
+            const int32_t top_k     = std::min(64, std::max(2, top_k_req));
+
+            if (top_k != top_k_req) {
+                SPC_TRC("mirrored draft top_k clamped %d -> %d for seq_id=%d\n", top_k_req, top_k, (int) seq_id);
+            }
+
+            sparams.temp              = tgt->temp;
+            sparams.dynatemp_range    = tgt->dynatemp_range;
+            sparams.dynatemp_exponent = tgt->dynatemp_exponent;
+            sparams.top_k             = top_k;
+            sparams.min_keep          = tgt->min_keep;
+            sparams.top_p             = tgt->top_p;
+            sparams.min_p             = tgt->min_p;
+            sparams.top_n_sigma       = tgt->top_n_sigma;
+            sparams.typ_p             = tgt->typ_p;
+            sparams.samplers          = {
+                COMMON_SAMPLER_TYPE_TOP_N_SIGMA,
+                COMMON_SAMPLER_TYPE_TOP_K,
+                COMMON_SAMPLER_TYPE_TYPICAL_P,
+                COMMON_SAMPLER_TYPE_TOP_P,
+                COMMON_SAMPLER_TYPE_MIN_P,
+                COMMON_SAMPLER_TYPE_TEMPERATURE,
+            };
+        }
+
+        smpls[seq_id].reset(common_sampler_init(llama_get_model(params.ctx_dft), sparams));
+    }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
@@ -2178,6 +2287,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
 
+        // and of which ones are recording the proposal distribution for the target to verify against
+        std::vector<bool> record_proposal(n_seq, false);
+
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -2189,6 +2301,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             n_drafting++;
             drafting[seq_id] = true;
+
+            update_draft_sampler(seq_id, dp.sampling);
+
+            // a proposal is only recorded when the caller asked for one and told us what the target
+            // is sampling with; otherwise the head runs at its own temperature and a sampled draft
+            // would just lose acceptance rate
+            record_proposal[seq_id] = params.sample_proposal && dp.proposal != nullptr && dp.sampling != nullptr;
+
             common_sampler_reset(smpls[seq_id].get());
 
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
@@ -2260,10 +2380,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
-                // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
-
-                // only collect very high-confidence draft tokens
+                // only collect very high-confidence draft tokens - unchanged, still the top-1 prob
                 if (cur_p->data[0].p < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
@@ -2271,10 +2388,52 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                common_sampler_accept(smpl, id, true);
-
                 auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
+
+                // add drafted token for each sequence: the argmax as before, or a draw from the
+                // head's own distribution when the target will verify it by rejection sampling
+                llama_token id = cur_p->data[0].id;
+
+                if (record_proposal[seq_id]) {
+                    if (smpl_greedy[seq_id]) {
+                        // the target is greedy, so the argmax with q = 1 is a genuine one-hot
+                        // proposal and the acceptance test reduces to today's exact match
+                        const uint32_t off = (uint32_t) dp.proposal->support.size();
+
+                        dp.proposal->support.push_back({ id, 0.0f, 1.0f });
+                        dp.proposal->steps.push_back({ 1.0f, off, 1 });
+                    } else {
+                        const int sel = cur_p->selected;
+
+                        double sum_q = 0.0;
+                        for (size_t k = 0; k < cur_p->size; ++k) {
+                            sum_q += cur_p->data[k].p;
+                        }
+
+                        if (sel < 0 || sel >= (int) cur_p->size || !std::isfinite(sum_q) ||
+                                std::fabs(sum_q - 1.0) > 1e-3 || !(cur_p->data[sel].p > 0.0f)) {
+                            // the candidate array is not a usable distribution (backend sampling can
+                            // hand back raw logits). drop the proposal for this sequence so the
+                            // target falls back to the exact-match test.
+                            SPC_DBG("dropping draft proposal for seq_id=%d (candidates are not a distribution)\n", (int) seq_id);
+
+                            record_proposal[seq_id] = false;
+                            dp.proposal->clear();
+                        } else {
+                            id = cur_p->data[sel].id;
+
+                            const uint32_t off = (uint32_t) dp.proposal->support.size();
+                            for (size_t k = 0; k < cur_p->size; ++k) {
+                                dp.proposal->support.push_back(cur_p->data[k]);
+                            }
+                            dp.proposal->steps.push_back({ cur_p->data[sel].p, off, (uint32_t) cur_p->size });
+                        }
+                    }
+                }
+
+                // the head must condition on what it actually emitted
+                common_sampler_accept(smpl, id, true);
 
                 result.push_back(id);
 
@@ -2327,6 +2486,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+
+                if (dp.proposal) {
+                    dp.proposal->clear();
+                }
             }
         }
     }
@@ -3398,6 +3561,7 @@ void common_speculative_draft(common_speculative * spec) {
 
         for (auto & dp : dparams) {
             GGML_ASSERT(!dp.drafting || dp.result->empty());
+            GGML_ASSERT(!dp.drafting || dp.proposal == nullptr || dp.proposal->empty());
 
             if (dp.drafting) {
                 n_drafting++;
@@ -3435,6 +3599,12 @@ void common_speculative_draft(common_speculative * spec) {
                     if (!result.empty() && (int) result.size() > dp.n_max) {
                         SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
                         result.resize(dp.n_max);
+
+                        // the proposal must stay the same length as the draft, otherwise the target
+                        // sees a mismatch and drops back to the exact-match test
+                        if (dp.proposal && dp.proposal->steps.size() > result.size()) {
+                            dp.proposal->steps.resize(result.size());
+                        }
                     }
                 }
 
