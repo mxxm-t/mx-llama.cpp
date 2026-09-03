@@ -3890,6 +3890,9 @@ private:
 
             GGML_ASSERT(n_draft > 0);
 
+            // logits row of each verify position, used for the token probabilities below
+            std::vector<int32_t> i_batch;
+
             // verify and try to accept the draft
             {
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
@@ -3901,6 +3904,7 @@ private:
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                i_batch = std::move(slot.spec_i_batch);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -3986,9 +3990,13 @@ private:
 
                 result.tok          = ids[i];
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-                result.prob         = 1.0f; // set later
+                result.prob         = 1.0f;
 
-                // TODO: set result.probs
+                if (slot.task->params.sampling.n_probs > 0 && i < i_batch.size()) {
+                    // post-sampling candidates only describe the last position
+                    const bool post = slot.task->params.post_sampling_probs && i + 1 == ids.size();
+                    populate_token_probs(slot, result, post, params_base.special, i_batch[i]);
+                }
 
                 slot.stats.n_gen += 1;
 
