@@ -1484,6 +1484,20 @@ static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * re
     ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_butterfly;
 }
 
+// The internal AllReduce is a CUDA-only feature: in HIP and MUSA builds
+// ggml_cuda_ar_pipeline_init() is a stub that always returns nullptr (see the
+// #else branch at the end of ggml-cuda/allreduce.cu), so "internal" resolves to
+// the meta-backend butterfly on those backends no matter what.  Knowing that at
+// compile time lets the messages below say what actually happens instead of
+// reporting an init failure that was never avoidable.
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+static constexpr bool         ggml_cuda_has_internal_allreduce  = false;
+static constexpr const char * ggml_cuda_internal_allreduce_name = "meta-backend butterfly AllReduce";
+#else
+static constexpr bool         ggml_cuda_has_internal_allreduce  = true;
+static constexpr const char * ggml_cuda_internal_allreduce_name = "internal AllReduce";
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+
 static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context * ret) {
     ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
     if (ret->ar_pipeline) {
@@ -1493,8 +1507,14 @@ static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context 
 
     // Clear sticky CUDA error from the failed init.
     (void) cudaGetLastError();
-    GGML_LOG_WARN("internal AllReduce init failed (n_devices != 2?); "
-                  "falling back to meta-backend butterfly\n");
+    if (ggml_cuda_has_internal_allreduce) {
+        GGML_LOG_WARN("internal AllReduce init failed (n_devices != 2?); "
+                      "falling back to meta-backend butterfly\n");
+    } else {
+        // Nothing failed -- this backend has no internal AllReduce to begin with.
+        GGML_LOG_DEBUG("%s: internal AllReduce is not built for this backend; "
+                       "using the meta-backend butterfly\n", __func__);
+    }
     ggml_backend_cuda_comm_init_none(ret);
 }
 
@@ -1615,9 +1635,10 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
                        "use GGML_CUDA_ALLREDUCE=internal or unset it to fall back\n", why);
         }
         GGML_LOG_WARN("NCCL initialised but the probe AllReduce failed (%s); "
-                      "falling back to internal AllReduce "
+                      "falling back to the %s "
                       "(GGML_CUDA_ALLREDUCE=nccl|internal|none forces a mode, "
-                      "GGML_CUDA_RCCL_PROBE=0 skips the probe)\n", why);
+                      "GGML_CUDA_RCCL_PROBE=0 skips the probe)\n",
+                      why, ggml_cuda_internal_allreduce_name);
         ggml_backend_cuda_comm_init_internal(ret);
         return;
     }
