@@ -354,7 +354,15 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #else                             // GGML_CUDA_USE_CUB
 #if defined(GGML_USE_HIP)
     if (ncols > 1024) {
-        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        // the histogram workspace is 64 KiB per row, loop the rows in chunks to bound it
+        constexpr size_t radix_ws_budget = 256u << 20;
+        const int blocks_per_row = (int) std::min<int64_t>((ncols + 1023) / 1024, 64);
+        const size_t ws_per_row  = (size_t) blocks_per_row * 256 * sizeof(int) + sizeof(top_k_radix_state);
+        const int64_t chunk_nrows = std::max<int64_t>(1, std::min<int64_t>(nrows, radix_ws_budget / ws_per_row));
+        for (int64_t i = 0; i < nrows; i += chunk_nrows) {
+            const int iter_nrows = (int) std::min<int64_t>(chunk_nrows, nrows - i);
+            top_k_radix_cuda(pool, src0_d + ncols * i, dst_d + k * i, ncols, iter_nrows, k, stream);
+        }
     } else {
 #endif // defined(GGML_USE_HIP)
         ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
