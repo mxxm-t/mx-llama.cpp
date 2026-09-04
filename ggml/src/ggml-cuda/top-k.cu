@@ -138,41 +138,132 @@ static __global__ void top_k_radix_select(
     }
 }
 
-static __global__ void top_k_radix_reset_counters(top_k_radix_state * states, int nrows) {
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row < nrows) {
-        states[row].greater_count = 0;
-        states[row].equal_count = 0;
-    }
-}
-
-template<int BLOCK_SIZE>
-static __global__ void top_k_radix_gather(
+// count, prefix and gather in a fixed block/thread order so the output order does not depend on scheduling
+template<int BLOCK_SIZE, int RADIX_BITS>
+static __global__ void top_k_radix_count(
         const float * __restrict__ src,
-        int * __restrict__ dst,
-        top_k_radix_state * __restrict__ states,
+        const top_k_radix_state * __restrict__ states,
+        int * __restrict__ block_counts,
         int ncols,
-        int k,
         int blocks_per_row) {
+    constexpr int NBINS = 1 << RADIX_BITS;
+
     const int row = blockIdx.x / blocks_per_row;
     const int row_block = blockIdx.x % blocks_per_row;
     const int tid = threadIdx.x;
     const float * row_src = src + (size_t) row * ncols;
-    int * row_dst = dst + (size_t) row * k;
-    top_k_radix_state * state = &states[row];
+    const top_k_radix_state state = states[row];
+    __shared__ int counts[2][BLOCK_SIZE];
+
+    int greater = 0;
+    int equal = 0;
 
     for (int col = row_block * BLOCK_SIZE + tid;
          col < ncols;
          col += blocks_per_row * BLOCK_SIZE) {
         const uint32_t key = top_k_float_to_ordered(row_src[col]);
-        if (key > state->prefix) {
-            const int pos = atomicAdd(&state->greater_count, 1);
-            row_dst[pos] = col;
-        } else if (key == state->prefix) {
-            const int pos = atomicAdd(&state->equal_count, 1);
-            if (pos < state->rank) {
-                row_dst[k - state->rank + pos] = col;
+        greater += key > state.prefix;
+        equal += key == state.prefix;
+    }
+
+    counts[0][tid] = greater;
+    counts[1][tid] = equal;
+    __syncthreads();
+    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            counts[0][tid] += counts[0][tid + stride];
+            counts[1][tid] += counts[1][tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        const size_t offset = ((size_t) row * blocks_per_row + row_block) * NBINS;
+        block_counts[offset + 0] = counts[0][0];
+        block_counts[offset + 1] = counts[1][0];
+    }
+}
+
+template<int RADIX_BITS>
+static __global__ void top_k_radix_offsets(
+        int * __restrict__ block_counts,
+        int blocks_per_row) {
+    constexpr int NBINS = 1 << RADIX_BITS;
+    const int row = blockIdx.x;
+    int greater_offset = 0;
+    int equal_offset = 0;
+
+    for (int row_block = 0; row_block < blocks_per_row; ++row_block) {
+        const size_t offset = ((size_t) row * blocks_per_row + row_block) * NBINS;
+        const int greater = block_counts[offset + 0];
+        const int equal = block_counts[offset + 1];
+        block_counts[offset + 0] = greater_offset;
+        block_counts[offset + 1] = equal_offset;
+        greater_offset += greater;
+        equal_offset += equal;
+    }
+}
+
+template<int BLOCK_SIZE, int RADIX_BITS>
+static __global__ void top_k_radix_gather(
+        const float * __restrict__ src,
+        int * __restrict__ dst,
+        const top_k_radix_state * __restrict__ states,
+        const int * __restrict__ block_offsets,
+        int ncols,
+        int k,
+        int blocks_per_row) {
+    constexpr int NBINS = 1 << RADIX_BITS;
+
+    const int row = blockIdx.x / blocks_per_row;
+    const int row_block = blockIdx.x % blocks_per_row;
+    const int tid = threadIdx.x;
+    const float * row_src = src + (size_t) row * ncols;
+    int * row_dst = dst + (size_t) row * k;
+    const top_k_radix_state state = states[row];
+    __shared__ int counts[2][BLOCK_SIZE];
+
+    int greater = 0;
+    int equal = 0;
+    for (int col = row_block * BLOCK_SIZE + tid;
+         col < ncols;
+         col += blocks_per_row * BLOCK_SIZE) {
+        const uint32_t key = top_k_float_to_ordered(row_src[col]);
+        greater += key > state.prefix;
+        equal += key == state.prefix;
+    }
+
+    counts[0][tid] = greater;
+    counts[1][tid] = equal;
+    __syncthreads();
+    for (int stride = 1; stride < BLOCK_SIZE; stride <<= 1) {
+        int add_greater = 0;
+        int add_equal = 0;
+        if (tid >= stride) {
+            add_greater = counts[0][tid - stride];
+            add_equal = counts[1][tid - stride];
+        }
+        __syncthreads();
+        counts[0][tid] += add_greater;
+        counts[1][tid] += add_equal;
+        __syncthreads();
+    }
+
+    const size_t offset = ((size_t) row * blocks_per_row + row_block) * NBINS;
+    int greater_pos = block_offsets[offset + 0] + counts[0][tid] - greater;
+    int equal_pos = block_offsets[offset + 1] + counts[1][tid] - equal;
+
+    for (int col = row_block * BLOCK_SIZE + tid;
+         col < ncols;
+         col += blocks_per_row * BLOCK_SIZE) {
+        const uint32_t key = top_k_float_to_ordered(row_src[col]);
+        if (key > state.prefix) {
+            row_dst[greater_pos++] = col;
+        } else if (key == state.prefix) {
+            if (equal_pos < state.rank) {
+                row_dst[k - state.rank + equal_pos] = col;
             }
+            ++equal_pos;
         }
     }
 }
@@ -201,11 +292,14 @@ static void top_k_radix_cuda(
             <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
     }
 
-    top_k_radix_reset_counters
-        <<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows);
-    top_k_radix_gather<BLOCK_SIZE>
+    top_k_radix_count<BLOCK_SIZE, RADIX_BITS>
         <<<row_grid, BLOCK_SIZE, 0, stream>>>(
-            src, dst, states, ncols, k, blocks_per_row);
+            src, states, histograms, ncols, blocks_per_row);
+    top_k_radix_offsets<RADIX_BITS>
+        <<<nrows, 1, 0, stream>>>(histograms, blocks_per_row);
+    top_k_radix_gather<BLOCK_SIZE, RADIX_BITS>
+        <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+            src, dst, states, histograms, ncols, k, blocks_per_row);
 }
 
 #endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
