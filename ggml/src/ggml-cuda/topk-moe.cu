@@ -16,20 +16,26 @@ struct topk_moe_config {
 // Warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path.
 template <int experts_per_thread, bool use_limit>
 __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
-    float max_val = -INFINITY;
+    // same reduction order as the standalone softmax: contiguous WARP_SIZE groups, then the group results
+    float group_reductions[experts_per_thread];
 
 #pragma unroll
     for (int i = 0; i < experts_per_thread; i++) {
         const int  idx    = lane + i * WARP_SIZE;
         const bool active = !use_limit || (idx < limit);
-        if (active) {
-            max_val = max(max_val, vals[i]);
+        group_reductions[i] = warp_reduce_max(active ? vals[i] : -INFINITY);
+    }
+
+    float max_val = -INFINITY;
+
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        if (lane == i) {
+            max_val = group_reductions[i];
         }
     }
 
     max_val = warp_reduce_max(max_val);
-
-    float sum = 0.f;
 
 #pragma unroll
     for (int i = 0; i < experts_per_thread; i++) {
@@ -38,9 +44,18 @@ __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const in
         if (active) {
             const float val = expf(vals[i] - max_val);
             vals[i]         = val;
-            sum += val;
         } else {
             vals[i] = 0.f;
+        }
+        group_reductions[i] = warp_reduce_sum(vals[i]);
+    }
+
+    float sum = 0.f;
+
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        if (lane == i) {
+            sum = group_reductions[i];
         }
     }
 
@@ -170,8 +185,6 @@ __global__ void topk_moe_cuda(const float *         logits,
     //or the raw logits. We do the argmax reduce over n_expert_used, each time marking
     //the expert weight as -inf to exclude from the next iteration
 
-    float wt_sum = 0.f;
-
     float output_weights[experts_per_thread];
 
 #pragma unroll
@@ -243,19 +256,32 @@ __global__ void topk_moe_cuda(const float *         logits,
 
         if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
             ids[k] = max_expert;
-            if (config.with_norm) {
-                wt_sum += max_val;
-            }
         }
     }
 
     if (config.with_norm) {
-        wt_sum              = warp_reduce_sum(wt_sum);
-        wt_sum              = max(wt_sum, clamp_val);
-        const float inv_sum = 1.0f / wt_sum;
+        // same order as the unfused path: contiguous WARP_SIZE groups, clamp, then divide
+        float group_sums[experts_per_thread];
+
+#pragma unroll
+        for (int i = 0; i < experts_per_thread; i++) {
+            group_sums[i] = warp_reduce_sum(output_weights[i]);
+        }
+
+        float wt_sum = 0.f;
+
+#pragma unroll
+        for (int i = 0; i < experts_per_thread; i++) {
+            if (threadIdx.x == i) {
+                wt_sum = group_sums[i];
+            }
+        }
+
+        wt_sum = warp_reduce_sum(wt_sum);
+        wt_sum = fmaxf(wt_sum, clamp_val);
 
         for (int i = 0; i < experts_per_thread; i++) {
-            output_weights[i] *= inv_sum;
+            output_weights[i] /= wt_sum;
         }
     }
 
