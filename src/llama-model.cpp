@@ -929,6 +929,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const uint32_t n_gqa    = hparams.n_gqa(il);
             const uint32_t n_embd_q = n_gqa * hparams.n_embd_head_k(il);
 
+            // Hybrid archs whose loaders leave the per-layer attention counts zeroed
+            // (e.g. nemotron_h_moe) still route non-recurrent tensors like ffn_exps
+            // through here; with n_gqa == 0 there is no Q/KV semantics to scale by,
+            // so fall through to the shared expert/FFN rules below instead of
+            // dividing by zero.
+            if (n_gqa > 0 && n_embd_q > 0) {
             // to handle head sizes like 80, only increase granularity while it doesn't cause underutilization
             int64_t blck_size_perf = blck_size;
             while (blck_size_perf < 128 && blck_size_perf*ud->n_devices < n_embd_q) {
@@ -1005,6 +1011,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 GGML_ASSERT(segments.size() == 2);
                 return {granularity_q, granularity_kv};
             }
+            } // n_gqa > 0 && n_embd_q > 0
         }
 
         // Shared expert. It splits on the same axes as the routed FFN, so it needs a

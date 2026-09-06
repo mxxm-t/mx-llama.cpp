@@ -1149,7 +1149,9 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_BITNET:
         case LLM_ARCH_T5:
         case LLM_ARCH_NEMOTRON_H:
-        case LLM_ARCH_NEMOTRON_H_MOE:
+        // NEMOTRON_H_MOE is deliberately absent: the fork runs it under -sm tensor via
+        // llm_arch_sm_tensor_replicates_attention (design A). Do not re-add it.
+        // Dense NEMOTRON_H stays gated - no routed experts, pure mirror loss.
         case LLM_ARCH_GRANITE_HYBRID:
         // MINIMAX_M2 is deliberately absent: the fork supports it under -sm tensor.
         // Do not re-add it. LFM2/LFM2MOE were dropped from this list by upstream.
@@ -1157,7 +1159,8 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_MINIMAX_M3:
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_KIMI_LINEAR:
-        case LLM_ARCH_BAILINGMOE3:
+        // BAILINGMOE3 is deliberately absent: the fork runs it under -sm tensor via
+        // llm_arch_sm_tensor_replicates_attention (design A). Do not re-add it.
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_QWEN3TTS:
             return false;
@@ -1173,6 +1176,18 @@ bool llm_arch_sm_tensor_replicates_attention(const llm_arch & arch) {
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
+        // bailingmoe3 pairs the same single-latent MLA attention with gated-delta-net
+        // layers whose conv/recurrent state cannot be row-split either, so everything
+        // except the routed experts mirrors per lane. The generic ffn(_exps)/shexp
+        // patterns already cover its MoE tensor names, and the router (ffn_gate_inp)
+        // falls through to the mirrored default, keeping expert selection
+        // bit-identical across lanes.
+        case LLM_ARCH_BAILINGMOE3:
+        // nemotron_h_moe interleaves mamba2 and attention blocks with routed experts.
+        // The mamba conv/recurrent state cannot be row-split and the attention adds
+        // little mass, so everything but the experts mirrors (design A); expert reads
+        // dominate this arch's per-token traffic, which is what the split targets.
+        case LLM_ARCH_NEMOTRON_H_MOE:
             return true;
         default:
             return false;
