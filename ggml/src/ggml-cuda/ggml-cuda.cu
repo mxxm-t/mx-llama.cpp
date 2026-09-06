@@ -1484,6 +1484,20 @@ static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * re
     ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_butterfly;
 }
 
+// The internal AllReduce is a CUDA-only feature: in HIP and MUSA builds
+// ggml_cuda_ar_pipeline_init() is a stub that always returns nullptr (see the
+// #else branch at the end of ggml-cuda/allreduce.cu), so "internal" resolves to
+// the meta-backend butterfly on those backends no matter what.  Knowing that at
+// compile time lets the messages below say what actually happens instead of
+// reporting an init failure that was never avoidable.
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+static constexpr bool         ggml_cuda_has_internal_allreduce  = false;
+static constexpr const char * ggml_cuda_internal_allreduce_name = "meta-backend butterfly AllReduce";
+#else
+static constexpr bool         ggml_cuda_has_internal_allreduce  = true;
+static constexpr const char * ggml_cuda_internal_allreduce_name = "internal AllReduce";
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+
 static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context * ret) {
     ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
     if (ret->ar_pipeline) {
@@ -1493,12 +1507,105 @@ static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context 
 
     // Clear sticky CUDA error from the failed init.
     (void) cudaGetLastError();
-    GGML_LOG_WARN("internal AllReduce init failed (n_devices != 2?); "
-                  "falling back to meta-backend butterfly\n");
+    if (ggml_cuda_has_internal_allreduce) {
+        GGML_LOG_WARN("internal AllReduce init failed (n_devices != 2?); "
+                      "falling back to meta-backend butterfly\n");
+    } else {
+        // Nothing failed -- this backend has no internal AllReduce to begin with.
+        GGML_LOG_DEBUG("%s: internal AllReduce is not built for this backend; "
+                       "using the meta-backend butterfly\n", __func__);
+    }
     ggml_backend_cuda_comm_init_none(ret);
 }
 
-static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * ret) {
+#ifdef GGML_USE_NCCL
+// NCCL/RCCL can report a successful ncclCommInitAll -- P2P channels connected
+// and all -- and then fail on the very first collective.  Seen on gfx906/MI50
+// with PCIe peer access enabled and RCCL 2.30.4, where the first AllReduce
+// dies with "unhandled cuda error"; on kernels without peer access the init
+// itself fails instead and the clean fallback below is taken.  So run a tiny
+// AllReduce here, check it without the aborting NCCL_CHECK macro, and verify
+// the sum, while falling back is still possible.  GGML_CUDA_RCCL_PROBE=0 skips it.
+static bool ggml_backend_cuda_comm_nccl_probe(ggml_backend_cuda_comm_context * ret, const char ** why) {
+    *why = nullptr;
+
+    const char * env_probe = getenv("GGML_CUDA_RCCL_PROBE");
+    if (env_probe && env_probe[0] == '0') {
+        return true;
+    }
+
+    const size_t n        = ret->comms.size();
+    const int    ne       = 64;
+    const float  expected = (float) (n * (n + 1) / 2); // rank i contributes i+1
+
+    std::vector<float *> bufs(n, nullptr);
+    std::vector<float>   host(ne);
+
+    for (size_t i = 0; i < n && *why == nullptr; ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) ret->backends[i]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+        for (int j = 0; j < ne; ++j) {
+            host[j] = (float) (i + 1);
+        }
+        if (cudaMalloc(&bufs[i], ne*sizeof(float)) != cudaSuccess ||
+            cudaMemcpy(bufs[i], host.data(), ne*sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+            *why = "probe buffer setup failed";
+        }
+    }
+
+    if (*why == nullptr) {
+        ncclResult_t rc = ncclGroupStart();
+        for (size_t i = 0; i < n && rc == ncclSuccess; ++i) {
+            ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) ret->backends[i]->context;
+            rc = ncclAllReduce(bufs[i], bufs[i], ne, ncclFloat, ncclSum, ret->comms[i], cuda_ctx->stream());
+        }
+        const ncclResult_t rc_end = ncclGroupEnd();
+        rc = rc != ncclSuccess ? rc : rc_end;
+        if (rc != ncclSuccess) {
+            *why = ncclGetErrorString(rc);
+        }
+    }
+
+    // The MI50 failure is asynchronous - the calls above all return ncclSuccess
+    // and the error only surfaces on the stream sync and in ncclCommGetAsyncError,
+    // so check both, then check the arithmetic in case it fails silently.
+    for (size_t i = 0; i < n && *why == nullptr; ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) ret->backends[i]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+        ncclResult_t async_rc = ncclSuccess;
+        if (cudaStreamSynchronize(cuda_ctx->stream()) != cudaSuccess) {
+            *why = "probe AllReduce failed on stream synchronize";
+        } else if (ncclCommGetAsyncError(ret->comms[i], &async_rc) != ncclSuccess) {
+            *why = "ncclCommGetAsyncError failed";
+        } else if (async_rc != ncclSuccess) {
+            *why = ncclGetErrorString(async_rc);
+        } else if (cudaMemcpy(host.data(), bufs[i], ne*sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            *why = "probe result readback failed";
+        } else {
+            for (int j = 0; j < ne; ++j) {
+                if (host[j] != expected) {
+                    *why = "probe AllReduce returned a wrong sum";
+                    break;
+                }
+            }
+        }
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        if (bufs[i] != nullptr) {
+            ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) ret->backends[i]->context;
+            ggml_cuda_set_device(cuda_ctx->device);
+            (void) cudaFree(bufs[i]);
+        }
+    }
+    (void) cudaGetLastError(); // clear any sticky error left by the failed probe
+    return *why == nullptr;
+}
+#endif // GGML_USE_NCCL
+
+// forced: GGML_CUDA_ALLREDUCE=nccl was asked for explicitly, so a failing probe
+// is an error rather than a reason to fall back.
+static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * ret, bool forced) {
 #ifdef GGML_USE_NCCL
     // Disabling NCCL path when CUDA virtual devices are in use since NCCL requires one distinct physical GPU per rank.
     const ggml_cuda_device_info & info = ggml_cuda_info();
@@ -1513,7 +1620,26 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     ret->comms.resize(n);
     ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
     if (rc == ncclSuccess) {
-        ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
+        const char * why = nullptr;
+        if (ggml_backend_cuda_comm_nccl_probe(ret, &why)) {
+            ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
+            return;
+        }
+        for (ncclComm_t comm : ret->comms) {
+            (void) ncclCommAbort(comm); // the comms are in an error state, Destroy can hang
+        }
+        ret->comms.clear();
+        if (forced) {
+            GGML_ABORT("NCCL init succeeded but the probe AllReduce failed (%s) and "
+                       "GGML_CUDA_ALLREDUCE=nccl was requested; "
+                       "use GGML_CUDA_ALLREDUCE=internal or unset it to fall back\n", why);
+        }
+        GGML_LOG_WARN("NCCL initialised but the probe AllReduce failed (%s); "
+                      "falling back to the %s "
+                      "(GGML_CUDA_ALLREDUCE=nccl|internal|none forces a mode, "
+                      "GGML_CUDA_RCCL_PROBE=0 skips the probe)\n",
+                      why, ggml_cuda_internal_allreduce_name);
+        ggml_backend_cuda_comm_init_internal(ret);
         return;
     }
 
@@ -1521,6 +1647,7 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     GGML_LOG_WARN("NCCL init failed (%s); falling back to internal AllReduce\n",
                   ncclGetErrorString(rc));
 #else // GGML_USE_NCCL
+    GGML_UNUSED(forced);
 #ifndef GGML_USE_HIP
     GGML_LOG_WARN("NCCL not compiled in; falling back to internal AllReduce.  "
                   "Recompile with -DGGML_CUDA_NCCL=ON for best multi-GPU performance.\n");
@@ -1562,14 +1689,14 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
     if (!env) {
         // Platform default: Linux uses NCCL, otherwise (generally Windows) internal
 #if defined(__linux__)
-        ggml_backend_cuda_comm_init_nccl(ret);
+        ggml_backend_cuda_comm_init_nccl(ret, /*forced =*/ false);
 #else
         ggml_backend_cuda_comm_init_internal(ret);
 #endif // defined(__linux__)
     } else {
         std::string env_str(env);
         if (env_str == "nccl") {
-            ggml_backend_cuda_comm_init_nccl(ret);
+            ggml_backend_cuda_comm_init_nccl(ret, /*forced =*/ true);
         } else if (env_str == "internal") {
             ggml_backend_cuda_comm_init_internal(ret);
         } else if (env_str == "none") {
