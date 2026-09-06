@@ -12,6 +12,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -120,6 +121,13 @@ struct common_sampler {
     std::vector<llama_token_data> cur;
 
     llama_token_data_array cur_p;
+
+    // rng for the speculative acceptance test, deliberately a separate stream from the `dist`
+    // sampler's, so that turning rejection sampling on never perturbs the tokens `dist` draws
+    std::mt19937 rng_accept;
+
+    // tracing: draft tokens accepted although the target sampled something else at that position
+    uint64_t n_accept_differs = 0;
 
     void reset() {
         prev.clear();
@@ -424,14 +432,25 @@ struct common_sampler * common_sampler_init(
         params.backend_sampling = false;
     }
 
+    // seed the acceptance rng from the request seed, mixed with a constant so that it is a
+    // different stream from the one `dist` uses. a request that asked for a random seed gets a
+    // random one here too.
+    uint32_t seed_accept = params.seed;
+    if (seed_accept == LLAMA_DEFAULT_SEED) {
+        seed_accept = std::random_device{}();
+    }
+    seed_accept ^= 0x9e3779b9u;
+
     auto * result = new common_sampler {
-        /* .params  = */ params,
-        /* .grmr    = */ grmr,
-        /* .rbudget = */ rbudget,
-        /* .chain   = */ chain,
-        /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
-        /* .cur     = */ {},
-        /* .cur_p   = */ {},
+        /* .params           = */ params,
+        /* .grmr             = */ grmr,
+        /* .rbudget          = */ rbudget,
+        /* .chain            = */ chain,
+        /* .prev             = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
+        /* .cur              = */ {},
+        /* .cur_p            = */ {},
+        /* .rng_accept       = */ std::mt19937(seed_accept),
+        /* .n_accept_differs = */ 0,
     };
 
     return result;
@@ -508,13 +527,15 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     return new common_sampler {
-        /* .params  = */ gsmpl->params,
-        /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
-        /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
-        /* .chain   = */ llama_sampler_clone(gsmpl->chain),
-        /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
+        /* .params           = */ gsmpl->params,
+        /* .grmr             = */ llama_sampler_clone(gsmpl->grmr),
+        /* .rbudget          = */ llama_sampler_clone(gsmpl->rbudget),
+        /* .chain            = */ llama_sampler_clone(gsmpl->chain),
+        /* .prev             = */ gsmpl->prev,
+        /* .cur              = */ gsmpl->cur,
+        /* .cur_p            = */ gsmpl->cur_p,
+        /* .rng_accept       = */ gsmpl->rng_accept,
+        /* .n_accept_differs = */ gsmpl->n_accept_differs,
     };
 }
 
@@ -530,7 +551,9 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     llama_sampler_copy(src->rbudget, dst->rbudget);
     llama_sampler_copy(src->chain,   dst->chain);
 
-    dst->params     = src->params;
+    dst->params           = src->params;
+    dst->rng_accept       = src->rng_accept;
+    dst->n_accept_differs = src->n_accept_differs;
     dst->prev       = src->prev;
     dst->cur        = src->cur;
     dst->cur_p      = src->cur_p;
@@ -675,21 +698,165 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+// a uniform draw in [0, 1) built by hand rather than with std::uniform_real_distribution, whose
+// state and exact output are implementation defined - we want the same numbers on every toolchain
+static float common_sampler_rand_u01(std::mt19937 & rng) {
+    return (float) (rng() >> 8) * (1.0f / 16777216.0f);
+}
+
+// q(id), 0 for anything outside the proposal's support
+static float common_draft_proposal_q(const llama_token_data * q, size_t n_q, llama_token id) {
+    for (size_t k = 0; k < n_q; ++k) {
+        if (q[k].id == id) {
+            return q[k].p;
+        }
+    }
+
+    return 0.0f;
+}
+
+common_draft_accept_result common_draft_accept_step(
+        const llama_token_data * p, size_t n_p,
+        const llama_token_data * q, size_t n_q,
+        llama_token x, float q_x,
+        llama_token id_sample,
+        std::mt19937 & rng) {
+    // a degenerate q means the draft and the proposal disagree about what was drawn. fall back to
+    // the exact-match test for this position, which is always a valid way to emit a draw from p.
+    if (!(q_x > 0.0f)) {
+        return { id_sample, x == id_sample };
+    }
+
+    float p_x = 0.0f;
+    for (size_t k = 0; k < n_p; ++k) {
+        if (p[k].id == x) {
+            p_x = p[k].p;
+            break;
+        }
+    }
+
+    // accept x with probability min(1, p(x)/q(x)); the two extremes need no randomness at all
+    bool accept;
+    if (p_x >= q_x) {
+        accept = true;
+    } else if (!(p_x > 0.0f)) {
+        accept = false;
+    } else {
+        accept = common_sampler_rand_u01(rng) * q_x < p_x;
+    }
+
+    if (accept) {
+        return { x, true };
+    }
+
+    // rejected: emit a draw from the residual r(y) = (p(y) - q(y))+ / Z. that plus the accept step
+    // above makes the emitted token exactly p-distributed.
+    double Z = 0.0;
+    for (size_t k = 0; k < n_p; ++k) {
+        const double r = (double) p[k].p - (double) common_draft_proposal_q(q, n_q, p[k].id);
+        if (r > 0.0) {
+            Z += r;
+        }
+    }
+
+    if (!(Z > 0.0)) {
+        // the residual is empty (p == q up to float noise); the target's own sample is already a
+        // draw from p, so use it
+        return { id_sample, false };
+    }
+
+    const double v = (double) common_sampler_rand_u01(rng) * Z;
+
+    double      acc  = 0.0;
+    llama_token last = LLAMA_TOKEN_NULL;
+
+    for (size_t k = 0; k < n_p; ++k) {
+        const double r = (double) p[k].p - (double) common_draft_proposal_q(q, n_q, p[k].id);
+        if (r <= 0.0) {
+            continue;
+        }
+
+        last = p[k].id;
+        acc += r;
+
+        if (acc > v) {
+            break;
+        }
+    }
+
+    // `last` can only be null if Z > 0 with no positive term, which cannot happen; guard anyway
+    // rather than emitting a null token
+    return { last != LLAMA_TOKEN_NULL ? last : id_sample, false };
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first, const common_draft_proposal * proposal) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    // is exact rejection sampling usable at all this round?
+    //
+    // it needs an honest proposal distribution for every drafted token, and an honest target
+    // distribution to compare it against. a grammar breaks the second half: with the default
+    // grammar_first = false the chain runs WITHOUT the grammar mask and only the token it picked is
+    // checked afterwards, so cur_p is not the constrained distribution and a residual draw could
+    // produce a grammar-invalid token. fall back to the exact-match test there.
+    //
+    // a reasoning budget is fine and deliberately not gated: it is applied to the candidates BEFORE
+    // the chain, so cur_p already reflects it. on a position where the budget is forcing its end
+    // sequence, p is one-hot on the forced token, so any other draft token has p = 0 and is
+    // rejected, and the residual collapses to the forced token - the new rule reproduces the forced
+    // output rather than fighting it. the state machine only requires that common_sampler_accept is
+    // called exactly once per position with the token we actually emit, which this loop guarantees.
+    bool use_rejection =
+        proposal != nullptr &&
+        !proposal->empty() &&
+        proposal->steps.size() == draft.size() &&
+        gsmpl->grmr == nullptr;
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        // exactly one sample and exactly one accept per position, as in the exact-match loop
+        const llama_token id_sample = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
-        common_sampler_accept(gsmpl, id, true);
+        llama_token emitted  = id_sample;
+        bool        rejected = draft[i] != id_sample;
 
-        result.push_back(id);
+        if (use_rejection) {
+            auto * cur_p = common_sampler_get_candidates(gsmpl, false);
 
-        if (draft[i] != id) {
+            // with backend sampling the candidate array can carry raw logits and all-zero
+            // probabilities. if it is not a distribution, do not pretend that it is.
+            double sum_p = 0.0;
+            for (size_t k = 0; k < cur_p->size; ++k) {
+                sum_p += cur_p->data[k].p;
+            }
+
+            if (!std::isfinite(sum_p) || std::fabs(sum_p - 1.0) > 1e-3) {
+                use_rejection = false;
+            } else {
+                const auto & st = proposal->steps[i];
+
+                const auto res = common_draft_accept_step(
+                        cur_p->data, cur_p->size,
+                        proposal->support.data() + st.off, st.n,
+                        draft[i], st.q, id_sample, gsmpl->rng_accept);
+
+                emitted  = res.id;
+                rejected = !res.accepted;
+
+                if (res.accepted && res.id != id_sample) {
+                    gsmpl->n_accept_differs++;
+                }
+            }
+        }
+
+        common_sampler_accept(gsmpl, emitted, true);
+
+        result.push_back(emitted);
+
+        if (rejected) {
             break;
         }
     }
@@ -716,6 +883,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
+}
+
+uint64_t common_sampler_get_n_accept_differs(const struct common_sampler * gsmpl) {
+    return gsmpl ? gsmpl->n_accept_differs : 0;
 }
 
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {

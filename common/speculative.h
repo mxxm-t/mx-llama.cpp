@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "common.h"
+#include "sampling.h"
 
 struct common_speculative;
 
@@ -69,6 +70,17 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // optional, caller-owned like `result`: if set, a drafter that samples its tokens records the
+    // proposal distribution q here, one entry per drafted token, so that the target can verify the
+    // draft with exact rejection sampling instead of an exact-match test. left empty by drafters
+    // that take the argmax, which is what makes this a no-op for them.
+    common_draft_proposal * proposal = nullptr;
+
+    // optional: the target's sampling parameters. a sampling drafter mirrors the target's
+    // temperature and truncation into its own head so that q stays close to p - without this the
+    // draft is drawn from a flatter distribution and the acceptance rate can fall.
+    const common_params_sampling * sampling = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

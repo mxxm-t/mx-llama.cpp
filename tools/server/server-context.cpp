@@ -259,6 +259,11 @@ struct server_slot {
     common_speculative * spec;
 
     llama_tokens spec_draft;
+
+    // the distribution the drafter drew `spec_draft` from, when it sampled rather than took the
+    // argmax. empty means "verify by exact match", which is what every other drafter gets.
+    common_draft_proposal spec_proposal;
+
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     std::vector<int32_t> spec_i_batch_last; // verify rows of the last sampled draft
@@ -392,6 +397,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_proposal.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -692,6 +698,8 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+            SLT_TRC(*this,
+                    " acc != tgt sample = %10llu\n", (unsigned long long) common_sampler_get_n_accept_differs(smpl.get()));
         }
 
         common_speculative_print_stats(spec);
@@ -3041,6 +3049,8 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .proposal = */ &slot.spec_proposal,
+                            /* .sampling = */ &slot.task->params.sampling,
                         };
 
                         drafting.push_back(&slot);
@@ -3937,8 +3947,11 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
+                // on a replay the "draft" is the target's own previous output, so exact matching
+                // already accepts all of it - do not run the rejection test over it
                 auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
+                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                            /* grammar_first */ false, slot.spec_is_replay ? nullptr : &slot.spec_proposal)
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
@@ -3980,6 +3993,8 @@ private:
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
 
+                        slot.spec_proposal.clear();
+
                         return;
                     }
                 }
@@ -3995,6 +4010,8 @@ private:
 
             const auto ids = std::move(slot.spec_draft);
             const auto i_batch = std::move(slot.spec_i_batch_last);
+
+            slot.spec_proposal.clear();
 
             size_t n_accepted = ids.size() - 1;
             if (slot.spec_is_replay && n_accepted > 0) {
@@ -4038,6 +4055,13 @@ private:
                     // candidates only describe the LAST position, so post-sampling
                     // probabilities are exact for the final token only and the earlier
                     // ones fall back to the model distribution at their row.
+                    //
+                    // With the sampled draft a rejected position emits a draw from the
+                    // residual (p - q)+ instead of from p directly. That token is always one
+                    // of the target's own candidates at its row, so both branches below find
+                    // it and report the target's probability p for it - the residual is the
+                    // draw mechanism, not a distribution worth reporting, and the emitted
+                    // sequence is p-distributed either way.
                     const bool post = slot.task->params.post_sampling_probs && i + 1 == ids.size();
                     populate_token_probs(slot, result, post, params_base.special, i_batch[i]);
                 }
