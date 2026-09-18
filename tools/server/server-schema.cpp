@@ -209,6 +209,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(0.0f, 1.0f)
         ->set_desc("Minimum speculative decoding probability for draft tokens (0 = greedy)"));
 
+    add((new field_bool("speculative.sample_proposal", params.speculative.draft.sample_proposal))
+        ->set_desc("Sample the drafted tokens and verify them by rejection sampling instead of exact match"));
+
 
     add((new field_str("speculative.type"))
         ->set_desc("Speculative decoding method (for debugging and research purposes)")

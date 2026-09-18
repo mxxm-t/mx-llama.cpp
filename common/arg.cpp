@@ -4233,6 +4233,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
     add_opt(common_arg(
+        {"--spec-draft-sample"},
+        {"--no-spec-draft-sample"},
+        string_format("sample the drafted tokens from the draft head and verify them by rejection sampling, "
+                      "instead of drafting the argmax and requiring an exact match (draft-mtp only) (default: %s)",
+                      params.speculative.draft.sample_proposal ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.sample_proposal = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLE"));
+    add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload)\n"
         "use --list-devices to see a list of available devices",
