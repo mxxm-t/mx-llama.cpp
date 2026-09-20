@@ -603,29 +603,55 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         }
     }
 
-    if (!overlap && !plan.state_pos.empty() && plan.state_write_idxs.empty()) {
+    // How many pooled blocks a ubatch completes depends on where its positions fall against the ratio
+    // boundary: a three-token batch at ratio 2 completes one block or two.
+    // The compressed-attention graph takes its block count from the read and write index lists, so that
+    // length change refuses graph reuse and the whole token graph is rebuilt.
+    // Padding every stream to the most blocks a batch of this size can complete keeps the lists a fixed
+    // length. The padding blocks write to the masked-out last cache slot, as the no-block-completed
+    // case has always done.
+    if (!overlap && !plan.state_pos.empty()) {
         assert(kv_size > 0);
         // the last slot must not be live, or the dummy write would corrupt it;
         // a full stream implies a completed block, which implies real writes
         assert(plan.n_kv < (int64_t) kv_size);
 
-        // Keep the compress/write ops in the graph when no pooled block completes in this ubatch.
-        // The dummy block writes to the last cache slot and is masked out.
-        uint32_t i = 0;
-        while (i < ubatch.n_tokens && ubatch.pos[i] < 0) {
-            ++i;
-        }
-        assert(i < ubatch.n_tokens);
+        const auto append_dummy_block = [&](llama_seq_id seq_id, uint32_t i) {
+            const int64_t cache_off = dsv4_stream_offset(n_stream, seq_id, kv_size);
+            const int32_t source_idx = state_source_idx(seq_id, ubatch.pos[i]);
 
-        const llama_seq_id seq_id = ubatch.seq_id[i][0];
-        const int64_t cache_off = dsv4_stream_offset(n_stream, seq_id, kv_size);
-        const int32_t source_idx = state_source_idx(seq_id, ubatch.pos[i]);
+            plan.state_write_idxs.push_back(cache_off + kv_size - 1);
+            plan.state_write_pos .push_back(0);
 
-        plan.state_write_idxs.push_back(cache_off + kv_size - 1);
-        plan.state_write_pos .push_back(0);
+            for (uint32_t j = 0; j < ratio; ++j) {
+                plan.state_read_idxs.push_back(source_idx);
+            }
+        };
 
-        for (uint32_t j = 0; j < ratio; ++j) {
-            plan.state_read_idxs.push_back(source_idx);
+        // ubatch.n_seq_tokens is 1 on a speculative verify batch that carries several tokens for the one
+        // sequence, so a block count taken from it is always 1 and pads nothing.
+        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+            const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+
+            uint32_t n_seq_tok = 0;
+            uint32_t i_first   = ubatch.n_tokens;
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                if (ubatch.pos[i] >= 0 && dsv4_token_has_seq(ubatch, i, seq_id)) {
+                    ++n_seq_tok;
+                    if (i_first == ubatch.n_tokens) {
+                        i_first = i;
+                    }
+                }
+            }
+            if (i_first == ubatch.n_tokens) {
+                continue;
+            }
+
+            const uint32_t n_blocks = (std::max<uint32_t>(1, n_seq_tok) + ratio - 1)/ratio;
+
+            for (uint32_t n_writes = state_write_counts[seq_id]; n_writes < n_blocks; ++n_writes) {
+                append_dummy_block(seq_id, i_first);
+            }
         }
     }
 
