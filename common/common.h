@@ -331,6 +331,12 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    // draw the drafted tokens from the head's distribution (mirroring the target's temperature and
+    // truncation) instead of taking its argmax, and hand the target the distribution they were drawn
+    // from so it can verify them by exact rejection sampling. off = the classic exact-match path.
+    // only the MTP drafter implements this.
+    bool sample_proposal = true;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

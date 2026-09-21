@@ -4,8 +4,57 @@
 
 #include "common.h"
 
+#include <random>
 #include <string>
 #include <vector>
+
+// the proposal distribution q that a speculative draft was drawn from, one entry per drafted token
+//
+// a drafter that samples its tokens (rather than taking the argmax) fills this in so that the
+// target can verify the draft with exact rejection sampling instead of an exact-match test.
+// a drafter that leaves it empty gets the classic exact-match behaviour.
+struct common_draft_proposal {
+    struct step {
+        float    q;    // q(draft[i]) under the proposal's own truncated, renormalized distribution
+        uint32_t off;  // offset of this step's support in `support`
+        uint32_t n;    // number of support entries
+    };
+
+    std::vector<step>             steps;
+    std::vector<llama_token_data> support; // flattened candidates; only .id and .p are meaningful
+
+    void clear() {
+        steps.clear();
+        support.clear();
+    }
+
+    bool empty() const {
+        return steps.empty();
+    }
+};
+
+struct common_draft_accept_result {
+    llama_token id;       // the token to emit at this position
+    bool        accepted; // whether the drafted token was accepted (i.e. whether to keep going)
+};
+
+// decide what to emit for one verified draft position, by exact rejection sampling.
+//
+// `p` is the target's candidate array and must sum to 1; `q` is the proposal's support and must sum
+// to 1 over itself. `x` is the drafted token and `q_x` is q(x). `id_sample` is the token the target's
+// own sampler drew at this position, used only as a fallback.
+//
+// accept x with probability min(1, p(x)/q(x)); on rejection emit a draw from the residual
+// (p - q)+ / Z. the emitted token is then distributed exactly as p, which is the whole point.
+//
+// exposed so it can be unit tested without a model. `rng` is only touched when a draw is actually
+// needed - a decision that is forced either way consumes no randomness.
+common_draft_accept_result common_draft_accept_step(
+        const llama_token_data * p, size_t n_p,
+        const llama_token_data * q, size_t n_q,
+        llama_token x, float q_x,
+        llama_token id_sample,
+        std::mt19937 & rng);
 
 // common_sampler extends llama_sampler with additional functionality:
 //
@@ -83,12 +132,24 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 //
 // returns at least 1 token, up to idxs.size()
 //
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
+// if `proposal` is non-null and describes the same number of steps as `draft`, the draft is verified
+// with exact rejection sampling (accept draft[i] with probability min(1, p/q), otherwise emit a draw
+// from the residual (p - q)+) instead of the exact-match test. the emitted tokens are distributed
+// exactly as the target's own sampler would have produced them, but more of the draft is accepted.
+// anything unusual (no proposal, a length mismatch, a grammar, or a candidate array whose
+// probabilities do not sum to 1) falls back to the exact-match test. a reasoning budget is not a
+// fallback case: it is applied before the sampler chain, so the candidates already reflect it.
+//
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false, const common_draft_proposal * proposal = nullptr);
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
+
+// number of draft tokens that rejection sampling accepted even though the target's own sample for
+// that position was a different token - i.e. the extra acceptances the new rule buys. tracing only.
+uint64_t common_sampler_get_n_accept_differs(const struct common_sampler * gsmpl);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
