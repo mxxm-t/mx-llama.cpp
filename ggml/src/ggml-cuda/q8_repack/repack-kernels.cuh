@@ -84,7 +84,7 @@ static __device__ __forceinline__ float rp_mmv_fusion_epilogue(
 }
 
 template <int ROWS, int NWAVES, bool HAS_IDS, int LANES = 64, bool HAS_FUSION = false>
-static __global__ void mul_mat_vec_q8_0_repacked(
+static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_q8_0_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
@@ -1133,7 +1133,7 @@ static __device__ __forceinline__ void mul_mat_vec_repacked_nc_impl(
 }
 
 template <int ROWS, int NWAVES, int NCOLS, int RPL = 1, int LANES = 64, ggml_type WT = GGML_TYPE_Q8_0>
-static __global__ void mul_mat_vec_repacked_nc(
+static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_repacked_nc(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t xs, const uint32_t ys) {

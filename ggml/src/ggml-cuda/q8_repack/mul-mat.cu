@@ -246,15 +246,51 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
             }
         } break;
-        case 4: {
-            const dim3 grid((ne01 + 1) / 2, 1, 1);
-            mul_mat_vec_repacked_nc<2, 1, 4, 2, 64, WT><<<grid, 64, 0, stream>>>(
-                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
-        } break;
+        case 4:
         case 5: {
-            const dim3 grid((ne01 + 1) / 2, 1, 1);
-            mul_mat_vec_repacked_nc<2, 1, 5, 2, 64, WT><<<grid, 64, 0, stream>>>(
-                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            // Rows per lane (RPL) and waves per workgroup, 64 lanes per row:
+            // every row keeps its lane/order, so results are unchanged.
+            // GGML_RP_NC_RPL 4 (default), 1, 2, 8; GGML_RP_NC_WAVES 4 (default), 1, 2.
+            // 4 and 5 columns tune separately (GGML_RP_NC5_*; default 32 lanes, RPL 2). GGML_RP_NC_LANES 32/16
+            // (4 waves, RPL 1 or 2) changes the reduction order.
+            static const int rpl4   = [] { const char * e = getenv("GGML_RP_NC_RPL");    return e ? atoi(e) : 4; }();
+            static const int waves4 = [] { const char * e = getenv("GGML_RP_NC_WAVES");  return e ? atoi(e) : 4; }();
+            static const int rpl5   = [] { const char * e = getenv("GGML_RP_NC5_RPL");   return e ? atoi(e) : 2; }();
+            static const int waves5 = [] { const char * e = getenv("GGML_RP_NC5_WAVES"); return e ? atoi(e) : waves4; }();
+            static const int lanes4 = [] { const char * e = getenv("GGML_RP_NC_LANES");  return e ? atoi(e) : 64; }();
+            static const int lanes5 = [] { const char * e = getenv("GGML_RP_NC5_LANES"); return e ? atoi(e) : 32; }();
+            const int rpl   = ne11 == 4 ? rpl4   : rpl5;
+            const int waves = ne11 == 4 ? waves4 : waves5;
+            const int lanes = ne11 == 4 ? lanes4 : lanes5;
+#define RP_NCL_LAUNCH(NC, L, R) \
+            mul_mat_vec_repacked_nc<(256 / (L)) * (R), 4, NC, R, L, WT><<<dim3((ne01 + (256 / (L)) * (R) - 1) / ((256 / (L)) * (R)), 1, 1), 256, 0, stream>>>( \
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys)
+            if (lanes == 32 || lanes == 16) {
+                if (ne11 == 4) {
+                    if (lanes == 32) { if (rpl == 1) RP_NCL_LAUNCH(4, 32, 1); else RP_NCL_LAUNCH(4, 32, 2); }
+                    else             { if (rpl == 1) RP_NCL_LAUNCH(4, 16, 1); else RP_NCL_LAUNCH(4, 16, 2); }
+                } else {
+                    if (lanes == 32) { if (rpl == 1) RP_NCL_LAUNCH(5, 32, 1); else RP_NCL_LAUNCH(5, 32, 2); }
+                    else             { if (rpl == 1) RP_NCL_LAUNCH(5, 16, 1); else RP_NCL_LAUNCH(5, 16, 2); }
+                }
+                break;
+            }
+#undef RP_NCL_LAUNCH
+#define RP_NC_LAUNCH(NC, R, NW) \
+            mul_mat_vec_repacked_nc<(R) * (NW), NW, NC, R, 64, WT><<<dim3((ne01 + (R) * (NW) - 1) / ((R) * (NW)), 1, 1), (NW) * 64, 0, stream>>>( \
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys)
+#define RP_NC_WAVES(NC, R) \
+            switch (waves) { case 2: RP_NC_LAUNCH(NC, R, 2); break; case 4: RP_NC_LAUNCH(NC, R, 4); break; default: RP_NC_LAUNCH(NC, R, 1); break; }
+#define RP_NC_RPL(NC) \
+            switch (rpl) { case 1: RP_NC_WAVES(NC, 1); break; case 4: RP_NC_WAVES(NC, 4); break; case 8: RP_NC_WAVES(NC, 8); break; default: RP_NC_WAVES(NC, 2); break; }
+            if (ne11 == 4) {
+                RP_NC_RPL(4);
+            } else {
+                RP_NC_RPL(5);
+            }
+#undef RP_NC_RPL
+#undef RP_NC_WAVES
+#undef RP_NC_LAUNCH
         } break;
         case 6: {
             const dim3 grid((ne01 + 1) / 2, 1, 1);
@@ -283,17 +319,18 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
     if (ne11 == 1) {
         switch (src0->type) {
             case GGML_TYPE_Q8_0: {
-                const dim3 grid((ne01 + 15) / 16, 1, 1);
                 // Measured A/B hook: route Q8_0 through the shared generic
                 // mat-vec. If it holds parity the bespoke kernel retires.
                 static const bool generic_mmv = getenv("GGML_RP_GENERIC_MMV") != nullptr;
                 if (generic_mmv) {
+                    const dim3 grid((ne01 + 15) / 16, 1, 1);
                     mul_mat_vec_rp<GGML_TYPE_Q8_0, 16, 16, false><<<grid, 1024, 0, stream>>>(
                         w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                         nullptr, 1, 0, 0, 0);
                     break;
                 }
-                mul_mat_vec_q8_0_repacked<16, 16, false><<<grid, 1024, 0, stream>>>(
+                const dim3 grid((ne01 + 3) / 4, 1, 1);
+                mul_mat_vec_q8_0_repacked<4, 4, false><<<grid, 256, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                     nullptr, nullptr, nullptr, 0, 1, 0, 0, 0,
                     nullptr, nullptr, nullptr, GGML_GLU_OP_REGLU);
@@ -522,10 +559,24 @@ void ggml_cuda_mul_mat_vec_repacked_fused(ggml_backend_cuda_context & ctx,
                 nullptr, 1, 0, 0, 0,
                 w_gate, x_bias_s, gate_bias_s, glu_op);
         } else {
-            mul_mat_vec_q8_0_repacked<16, 16, false, 64, true><<<grid, 1024, 0, stream>>>(
-                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                nullptr, nullptr, nullptr, 0, 1, 0, 0, 0,
-                w_gate, x_bias_s, gate_bias_s, glu_op);
+            // Rows per workgroup (one wave per row, so row math is unchanged):
+            // GGML_RP_FUSED_ROWS for plain fused mat-vec, GGML_RP_FUSED_ROWS_GLU
+            // for gate/up+GLU. 8 (default), 16, 4 or 2. 8 measured +2.4% TG on Qwen3.8-27B Q8_0.
+            static const int rows_plain = [] { const char * e = getenv("GGML_RP_FUSED_ROWS");     return e ? atoi(e) : 8; }();
+            static const int rows_glu   = [] { const char * e = getenv("GGML_RP_FUSED_ROWS_GLU"); return e ? atoi(e) : 8; }();
+            const int rows = w_gate ? rows_glu : rows_plain;
+#define RP_FUSED_LAUNCH(R) \
+            mul_mat_vec_q8_0_repacked<R, R, false, 64, true><<<dim3((ne01 + R - 1) / R, 1, 1), R * 64, 0, stream>>>( \
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, \
+                nullptr, nullptr, nullptr, 0, 1, 0, 0, 0, \
+                w_gate, x_bias_s, gate_bias_s, glu_op)
+            switch (rows) {
+                case 8:  RP_FUSED_LAUNCH(8); break;
+                case 4:  RP_FUSED_LAUNCH(4); break;
+                case 2:  RP_FUSED_LAUNCH(2); break;
+                default: RP_FUSED_LAUNCH(16); break;
+            }
+#undef RP_FUSED_LAUNCH
         }
     }
     }
