@@ -79,6 +79,40 @@ static void concat_cont_cuda(const T * x,
     concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
 }
 
+// Concatenate a short contiguous prefix with a transposed matrix without an intermediate copy.
+static __global__ void concat_transposed_32(
+        const uint32_t * prefix, const uint32_t * src, uint32_t * dst,
+        int64_t n_prefix, int64_t n_time, int64_t n_channels) {
+    __shared__ uint32_t tile[32][33];
+    const int x = threadIdx.x;
+    const int y = threadIdx.y;
+    const int64_t time = int64_t(blockIdx.x) * 32;
+    const int64_t channel = int64_t(blockIdx.y) * 32;
+    const int64_t plane = blockIdx.z;
+    const int64_t n_dst = n_prefix + n_time;
+
+    ggml_cuda_pdl_sync();
+    for (int j = y; j < 32; j += 8) {
+        if (channel + x < n_channels && time + j < n_time) {
+            tile[j][x] = src[(plane * n_time + time + j) * n_channels + channel + x];
+        }
+    }
+    __syncthreads();
+    for (int j = y; j < 32; j += 8) {
+        if (channel + j < n_channels && time + x < n_time) {
+            dst[(plane * n_channels + channel + j) * n_dst + n_prefix + time + x] = tile[x][j];
+        }
+    }
+    if (blockIdx.x == 0) {
+        for (int j = y; j < 32; j += 8) {
+            if (channel + j < n_channels && x < n_prefix) {
+                dst[(plane * n_channels + channel + j) * n_dst + x] =
+                    prefix[(plane * n_channels + channel + j) * n_prefix + x];
+            }
+        }
+    }
+}
+
 // non-contiguous kernel (slow)
 template <typename T, int dim>
 static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
@@ -139,8 +173,53 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// Same prefix + transposed concat for fewer than 32 time steps (speculative
+// verify batches): one thread per destination element, destination-ordered.
+static __global__ void concat_transposed_small(
+        const uint32_t * prefix, const uint32_t * src, uint32_t * dst,
+        int64_t n_prefix, int64_t n_time, int64_t n_channels, int64_t n_total) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n_total) {
+        return;
+    }
+    const int64_t n_dst   = n_prefix + n_time;
+    const int64_t j       = i % n_dst;
+    const int64_t row     = i / n_dst;          // plane * n_channels + channel
+    const int64_t channel = row % n_channels;
+    const int64_t plane   = row / n_channels;
+    ggml_cuda_pdl_sync();
+    dst[i] = j < n_prefix ? prefix[row * n_prefix + j]
+                          : src[(plane * n_time + (j - n_prefix)) * n_channels + channel];
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
+    if (sizeof(T) == sizeof(uint32_t) && !ggml_is_quantized(src0->type) && dim == 0 &&
+        src0->ne[0] <= 32 && src1->ne[0] < 32 &&
+        ggml_is_contiguous(src0) && ggml_is_contiguous(dst) &&
+        src1->nb[1] == sizeof(T) && src1->nb[0] == src1->ne[1] * sizeof(T) &&
+        src1->nb[2] == src1->ne[0] * src1->ne[1] * sizeof(T) &&
+        src1->nb[3] == src1->nb[2] * src1->ne[2]) {
+        const int64_t n_total = ggml_nelements(dst);
+        const ggml_cuda_kernel_launch_params params(dim3((n_total + 255) / 256), dim3(256), 0, stream);
+        ggml_cuda_kernel_launch(concat_transposed_small, params,
+                (const uint32_t *) src0->data, (const uint32_t *) src1->data, (uint32_t *) dst->data,
+                src0->ne[0], src1->ne[0], src1->ne[1], n_total);
+        return;
+    }
+    if (sizeof(T) == sizeof(uint32_t) && !ggml_is_quantized(src0->type) && dim == 0 &&
+        src0->ne[0] <= 32 && src1->ne[0] >= 32 && src1->ne[1] >= 32 && src1->ne[1] <= 65535 * 32 &&
+        ggml_is_contiguous(src0) && ggml_is_contiguous(dst) &&
+        src1->nb[1] == sizeof(T) && src1->nb[0] == src1->ne[1] * sizeof(T) &&
+        src1->nb[2] == src1->ne[0] * src1->ne[1] * sizeof(T) &&
+        src1->nb[3] == src1->nb[2] * src1->ne[2] && src1->ne[2] * src1->ne[3] <= 65535) {
+        const dim3 grid((src1->ne[0] + 31) / 32, (src1->ne[1] + 31) / 32, src1->ne[2] * src1->ne[3]);
+        const ggml_cuda_kernel_launch_params params(grid, dim3(32, 8), 0, stream);
+        ggml_cuda_kernel_launch(concat_transposed_32, params,
+                (const uint32_t *) src0->data, (const uint32_t *) src1->data, (uint32_t *) dst->data,
+                src0->ne[0], src1->ne[0], src1->ne[1]);
+        return;
+    }
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
         const T * src0_d = (const T *) src0->data;
         const T * src1_d = (const T *) src1->data;
