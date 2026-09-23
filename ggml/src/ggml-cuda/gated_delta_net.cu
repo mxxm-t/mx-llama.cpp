@@ -2,6 +2,29 @@
 #include "gated_delta_net_chunk.cuh"
 #include "ggml-cuda/common.cuh"
 
+#include <mutex>
+#include <unordered_map>
+
+// Elided state gathers, keyed by the consuming gated_delta_net node (set at the GET_ROWS,
+// taken at the GDN of the same graph evaluation).
+static std::mutex g_gdn_state_src_mutex;
+static std::unordered_map<const ggml_tensor *, ggml_cuda_gdn_state_src> g_gdn_state_src;
+
+void ggml_cuda_gdn_put_state_src(const ggml_tensor * gdn, const ggml_cuda_gdn_state_src & src) {
+    std::lock_guard<std::mutex> lock(g_gdn_state_src_mutex);
+    g_gdn_state_src[gdn] = src;
+}
+
+bool ggml_cuda_gdn_take_state_src(const ggml_tensor * gdn, ggml_cuda_gdn_state_src & src) {
+    std::lock_guard<std::mutex> lock(g_gdn_state_src_mutex);
+    auto it = g_gdn_state_src.find(gdn);
+    if (it == g_gdn_state_src.end()) {
+        return false;
+    }
+    src = it->second;
+    g_gdn_state_src.erase(it);
+    return true;
+}
 
 template <int S_v, bool KDA, bool keep_rs_t>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
@@ -31,7 +54,9 @@ gated_delta_net_cuda(const float * q,
                                      int64_t       state_slot_stride,
                                      int           K,
                                      const int32_t * snap_rows,
-                                     int64_t       snap_row_stride) {
+                                     int64_t       snap_row_stride,
+                                     const int32_t * state_in_rows,
+                                     int64_t       state_in_row_stride) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // each warp owns one column, using warp-level primitives to reduce across rows
@@ -49,7 +74,10 @@ gated_delta_net_cuda(const float * q,
     const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
     float * const state_base = state;
     state += state_out_offset;
-    curr_state += state_in_offset + col * S_v;
+    // state_in_rows (elided GET_ROWS): read the input state straight from its cache row
+    curr_state += (state_in_rows != nullptr
+        ? (int64_t) state_in_rows[sequence] * state_in_row_stride + (int64_t) h_idx * S_v * S_v
+        : state_in_offset) + col * S_v;
     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
@@ -185,7 +213,8 @@ static void launch_gated_delta_net(
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
         float scale, int64_t state_slot_stride, int K, cudaStream_t stream,
-        const int32_t * snap_rows = nullptr, int64_t snap_row_stride = 0) {
+        const int32_t * snap_rows = nullptr, int64_t snap_row_stride = 0,
+        const int32_t * state_in_rows = nullptr, int64_t state_in_row_stride = 0) {
     const int CS = KDA ? 16 : 64;
 
     // The chunked kernel emits per-token snapshots, so retained-state prefill no longer needs serial arithmetic.
@@ -207,7 +236,7 @@ static void launch_gated_delta_net(
     }
 
     if (chunk_eligible && (!keep_rs_t || !chunk_snap_off)) {
-        GGML_ASSERT(snap_rows == nullptr);
+        GGML_ASSERT(snap_rows == nullptr && state_in_rows == nullptr);
         launch_gated_delta_net_chunk<KDA, keep_rs_t>(
             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
             S_v, H, n_tokens, n_seqs, sq1, sq2, sq3,
@@ -232,26 +261,26 @@ static void launch_gated_delta_net(
             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, snap_rows, snap_row_stride);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, snap_rows, snap_row_stride, state_in_rows, state_in_row_stride);
             break;
         case 32:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, snap_rows, snap_row_stride);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, snap_rows, snap_row_stride, state_in_rows, state_in_row_stride);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, snap_rows, snap_row_stride);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, snap_rows, snap_row_stride, state_in_rows, state_in_row_stride);
             break;
         }
         case 128: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, snap_rows, snap_row_stride);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, snap_rows, snap_row_stride, state_in_rows, state_in_row_stride);
             break;
         }
         default:
@@ -296,6 +325,16 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const float * b_d = (const float *) src_beta->data;
 
     const float * s_d   = (const float *) src_state->data;
+    const int32_t * state_in_rows       = nullptr;
+    int64_t         state_in_row_stride = 0;
+    {
+        ggml_cuda_gdn_state_src src;
+        if (ggml_cuda_gdn_take_state_src(dst, src)) {
+            s_d                 = src.base;
+            state_in_rows       = src.rows;
+            state_in_row_stride = src.row_stride;
+        }
+    }
     float *       dst_d = (float *) dst->data;
 
     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
@@ -342,21 +381,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
         if (keep_rs) {
             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, snap_rows, snap_row_stride);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, snap_rows, snap_row_stride, state_in_rows, state_in_row_stride);
         } else {
             launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, snap_rows, snap_row_stride);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, snap_rows, snap_row_stride, state_in_rows, state_in_row_stride);
         }
     } else {
         if (keep_rs) {
             launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, snap_rows, snap_row_stride);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, snap_rows, snap_row_stride, state_in_rows, state_in_row_stride);
         } else {
             launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, snap_rows, snap_row_stride);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, snap_rows, snap_row_stride, state_in_rows, state_in_row_stride);
         }
     }
 }

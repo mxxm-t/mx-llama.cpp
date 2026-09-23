@@ -4549,7 +4549,94 @@ static bool ggml_cuda_moe_weighted_reduction_enabled() {
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// Returned by ggml_cuda_try_fuse when the node itself was handled (elided) and no further nodes are skipped.
+#define GGML_CUDA_FUSE_HANDLED_NO_SKIP (-1000000)
+
+// A one-sequence GET_ROWS that gathers the recurrent state for a short-batch gated_delta_net and
+// has no other reader: skip it and let the kernel read the state from its cache row in place.
+static bool ggml_cuda_try_elide_gdn_state_gather(const ggml_cgraph * cgraph, int i) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_GDN_INPLACE_STATE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const ggml_tensor * node = cgraph->nodes[i];
+    const ggml_tensor * src  = node->src[0];
+    const ggml_tensor * idx  = node->src[1];
+    if (!enabled || node->op != GGML_OP_GET_ROWS || node->type != GGML_TYPE_F32 || (node->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        src->type != GGML_TYPE_F32 || idx->type != GGML_TYPE_I32 || src->data == nullptr || idx->data == nullptr ||
+        node->ne[1] != 1 || node->ne[2] != 1 || node->ne[3] != 1 || idx->ne[0] != 1 ||
+        src->nb[0] != sizeof(float) || src->ne[0] != node->ne[0] || src->nb[1] % sizeof(float) != 0 ||
+        !ggml_is_contiguous(node)) {
+        return false;
+    }
+    const ggml_tensor * gdn = nullptr;
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * s = n->src[k];
+            if (s == nullptr || (s != node && s->view_src != node)) {
+                continue;
+            }
+            if (ggml_cuda_is_view_or_noop(n)) {
+                continue;
+            }
+            if (n->op != GGML_OP_GATED_DELTA_NET || k != 5 || gdn != nullptr || s->view_offs != 0 ||
+                ggml_nelements(s) != ggml_nelements(node) || !ggml_is_contiguous(s) ||
+                n->src[2]->ne[2] >= 32 || n->src[2]->ne[3] != 1) {
+                return false;
+            }
+            gdn = n;
+        }
+    }
+    if (gdn == nullptr) {
+        return false;
+    }
+    // The kernel reads the row index at the GDN, not at the gather: the index tensor must still be
+    // live there. It is only guaranteed if another node reads it after the GDN (the allocator may
+    // reuse its memory after the last reader, e.g. at the last recurrent layer).
+    bool idx_live = false;
+    bool past_gdn = false;
+    for (int j = i + 1; j < cgraph->n_nodes && !idx_live; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n == gdn) {
+            past_gdn = true;
+            continue;
+        }
+        if (!past_gdn) {
+            continue;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * s = n->src[k];
+            if (s != nullptr && (s == idx || s->view_src == idx)) {
+                idx_live = true;
+                break;
+            }
+        }
+    }
+    if (!idx_live) {
+        return false;
+    }
+    // Reading later must see what the gather would have: nothing between the gather and the GDN
+    // may write into the source cache (e.g. build_rs copying extra states).
+    const ggml_tensor * src_root = src->view_src ? src->view_src : src;
+    for (int j = i + 1; j < cgraph->n_nodes && cgraph->nodes[j] != gdn; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n) || ggml_nelements(n) == 0) {
+            continue;
+        }
+        if (n == src_root || n->view_src == src_root) {
+            return false;
+        }
+    }
+    ggml_cuda_gdn_put_state_src(gdn, { (const float *) src->data, (const int32_t *) idx->data,
+                                       (int64_t) (src->nb[1] / sizeof(float)) });
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    if (ggml_cuda_try_elide_gdn_state_gather(cgraph, i)) {
+        return GGML_CUDA_FUSE_HANDLED_NO_SKIP;
+    }
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
@@ -5509,6 +5596,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
+                if (nodes_to_skip == GGML_CUDA_FUSE_HANDLED_NO_SKIP) {
+                    continue;
+                }
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
