@@ -503,6 +503,24 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         GGML_ASSERT(inp->n_snap == n_written);
         GGML_ASSERT((int64_t) inp->s_write_slices.size() == n_written);
 
+        static const bool ring_fast = [] { const char * e = getenv("LLAMA_RING_FAST"); return e == nullptr || atoi(e) != 0; }();
+        if (ring_fast) {
+            // Scatter each snapshot window straight from conv_input: with the destination
+            // viewed as [cols, rows, channels] and the window permuted to [cols, n_seqs, channels],
+            // set_rows takes the strided source directly, so the per-window cont goes away.
+            const int64_t n_cols = conv_kernel_size - 1;
+            ggml_tensor * dst3 = ggml_view_3d(ctx0, conv_states_all,
+                    n_cols, conv_states_all->ne[1], conv_channels,
+                    conv_states_all->nb[1], ggml_row_size(conv_states_all->type, n_cols), 0);
+            for (int64_t snap = 0; snap < n_written; ++snap) {
+                ggml_tensor * window = ggml_view_3d(ctx0, conv_input,
+                        n_cols, conv_channels, n_seqs,
+                        conv_input->nb[1], conv_input->nb[2],
+                        ggml_row_size(conv_input->type, n_new - snap));
+                ggml_build_forward_expand(gf,
+                        ggml_set_rows(ctx0, dst3, ggml_permute(ctx0, window, 0, 2, 1, 3), inp->s_write_slices[snap]));
+            }
+        } else {
         for (int64_t snap = 0; snap < n_written; ++snap) {
             ggml_tensor * window = ggml_view_3d(ctx0, conv_input,
                     conv_kernel_size - 1, conv_channels, n_seqs,
@@ -513,6 +531,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
             ggml_build_forward_expand(gf,
                     ggml_set_rows(ctx0, conv_states_all, rows, inp->s_write_slices[snap]));
+        }
         }
     } else {
         // [TAG_RECURRENT_ROLLBACK_SPLITS]
@@ -616,8 +635,10 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     if (inp->s_write != nullptr) {
         GGML_ASSERT(inp->n_snap == n_written);
+        // src is already contiguous (rows j + n_seqs*s back to back); cont would copy it.
+        static const bool ring_fast = [] { const char * e = getenv("LLAMA_RING_FAST"); return e == nullptr || atoi(e) != 0; }();
         ggml_tensor * rows = ggml_reshape_2d(
-                ctx0, ggml_cont(ctx0, src), D, n_seqs * n_written);
+                ctx0, ring_fast && ggml_is_contiguous(src) ? src : ggml_cont(ctx0, src), D, n_seqs * n_written);
         ggml_build_forward_expand(gf,
                 ggml_set_rows(ctx0, ssm_states_all, rows, inp->s_write));
     } else {

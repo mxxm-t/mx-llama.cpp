@@ -3834,6 +3834,25 @@ static int ggml_cuda_try_gdn_cache_fusion(
         if (ggml_cuda_is_view_or_noop(n)) {
             continue;
         }
+        if (n->op == GGML_OP_SET_ROWS && !(n->flags & GGML_TENSOR_FLAG_OUTPUT) && K > 1 && n_tokens < 32) {
+            // Ring snapshots: SET_ROWS(cache, rows = contiguous snapshot tail, idx). The kernel
+            // writes slot s of sequence j straight to cache row idx[s * n_seqs + j].
+            const ggml_tensor * rows  = n->src[0];
+            const ggml_tensor * idx   = n->src[1];
+            const ggml_tensor * cache = n->src[2];
+            if (rows->view_src != gdn || rows->view_offs != tail_off || !ggml_is_contiguous(rows) ||
+                rows->ne[0] != D || rows->ne[1] != n_seqs * n_written || rows->ne[2] != 1 || rows->ne[3] != 1 ||
+                idx->type != GGML_TYPE_I32 || idx->ne[0] != n_seqs * n_written || !ggml_is_contiguous(idx) ||
+                cache->type != GGML_TYPE_F32 || cache->ne[0] != D || cache->data == nullptr ||
+                cache->nb[0] != sizeof(float) || cache->nb[1] % sizeof(float) != 0 || idx->data == nullptr) {
+                return 0;
+            }
+            fused_state_cpy.data            = (float *) cache->data;
+            fused_state_cpy.slot_stride     = 0;
+            fused_state_cpy.snap_rows       = (const int32_t *) idx->data;
+            fused_state_cpy.snap_row_stride = (int64_t) (cache->nb[1] / sizeof(float));
+            return j - node_idx;
+        }
         if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
             return 0;
         }
