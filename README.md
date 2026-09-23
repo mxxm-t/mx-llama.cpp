@@ -1,7 +1,54 @@
 <!-- fork banner -->
-> **mx-llama.cpp** - a fork of llama.cpp for multi-GPU inference. Backend-generic,
-> kernel tuning for AMD gfx906 (MI50).
-> Images: **[mxxm/mx-llama.cpp](https://hub.docker.com/r/mxxm/mx-llama.cpp)**
+> **MI50-llama.cpp** - single AMD Instinct MI50 (gfx906, 32 GB HBM2) decode and MTP tuning,
+> on top of [mx-llama.cpp](https://github.com/mxxm-t/mx-llama.cpp).
+
+### Results
+
+One MI50 32 GB, 300 W / 1825 MHz core / 1125 MHz HBM, ROCm 7.14. Qwen3.8-27B Q8_0, Q8_0 KV cache, `-fa on`, one slot.
+Decode is llama-bench TG64 at the stated occupied depth; MTP is llama-server with native MTP, 3 drafts.
+
+| Workload | mx-llama.cpp | MI50-llama.cpp |
+|---|---:|---:|
+| Decode, 2k context | 21.5 tok/s | 22.8 tok/s |
+| Decode, 16k context | 19.6 tok/s | 22.0 tok/s |
+| Decode, 64k context | 14.2 tok/s | 20.4 tok/s |
+| MTP, 64k reasoning prompt (seed 42, T 1.0) | 21.6 tok/s | 28.8 tok/s |
+| MTP, short code / prose prompt (greedy) | - | 51.8 / 43.2 tok/s |
+| MTP, 106.7k prompt (greedy) | - | 24.2 tok/s |
+| Max context (`-ub 512`) | - | 114,688 |
+
+The repack, concat and recurrent-state changes are output-identical in greedy and seeded checks. GQA6 attention changes FP32 summation order (checked against a 5e-4 gate; 16k perplexity +0.07%), so sampled text can differ from stock.
+
+### Settings
+
+```
+llama-server -m Qwen3.8-27B-Q8_0.gguf -ngl 99 -fa on -np 1 \
+  -c 66560 -b 2048 -ub 2048 -ctk q8_0 -ctv q8_0 -lm dio \
+  --spec-type draft-mtp --spec-draft-n-max 3
+```
+
+- Up to ~66k context: `-ub 2048`. Longer: `-ub 512`, up to `-c 114688` (`-ub 2048` above ~90k runs out of FA workspace).
+- One slot (`-np 1`) is as fast as several for MTP.
+
+### Changes in this fork
+
+- **GQA6 decode attention** (gfx906, D=256, 24 Q / 4 KV heads, Q8 KV): one K/V read serves all six query heads; 1-5 query rows for MTP verify. Decode keeps 90% of its speed from 2k to 64k.
+- **Repack mat-vec tuning**: 8-row workgroups for the fused FFN path, narrow-batch (MTP verify) layout and launch bounds that stop VGPR spills.
+- **Conv-state concat**: direct transposed concat, including batches under 32 tokens.
+- **Single-slot recurrent ring**: snapshot writes fused into `gated_delta_net` instead of copy + scatter (+7% MTP with one slot).
+- **In-place recurrent state**: `gated_delta_net` reads its input state from the cache row, skipping the gather.
+
+### From mx-llama.cpp (gfx906)
+
+- Weight repack for gfx906 (Q8_0 by [iacopPBK](https://github.com/iacopPBK); MXFP4, IQ4_NL, Q4_K, Q5_K, Q6_K, Q5_1)
+- Narrow-batch repacked mat-vec for speculative verify, quantized-activation cache, fused up/gate for MoE
+- MTP draft heads, snapshot-ring recurrent rollback, DFlash / DSpark
+- Multi-stage tensor parallelism, custom peer-write AllReduce
+
+Images and multi-GPU details: **[mxxm/mx-llama.cpp](https://hub.docker.com/r/mxxm/mx-llama.cpp)**.
+
+---
+<!-- mx-llama.cpp banner -->
 
 ```
 -sm tensor          [0 1 2 3 4 5 6 7]                  upstream: one group, all layers
