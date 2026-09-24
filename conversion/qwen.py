@@ -379,6 +379,13 @@ class Qwen3NextModel(_QwenMtpMixin, Qwen2MoeModel):
         self.gguf_writer.add_ssm_group_count(self.hparams["linear_num_key_heads"])
         self.gguf_writer.add_ssm_time_step_rank(self.hparams["linear_num_value_heads"])
         self.gguf_writer.add_ssm_inner_size(self.hparams["linear_value_head_dim"] * self.hparams["linear_num_value_heads"])
+        if (layer_types := self.hparams.get("layer_types")) is not None:
+            n_layer = self.hparams["num_hidden_layers"]
+            if len(layer_types) != n_layer:
+                raise ValueError(f"layer_types has {len(layer_types)} entries, expected num_hidden_layers ({n_layer})")
+            recurrent = [t == "linear_attention" for t in layer_types]
+            recurrent += [False] * (self.block_count - n_layer)
+            self.gguf_writer.add_recurrent_layers(recurrent)
         self.gguf_writer.add_full_attention_interval(self.hparams.get("full_attention_interval", 4))
         if (rope_dim := self.hparams.get("head_dim")) is None:
             rope_dim = self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
@@ -704,7 +711,7 @@ class DFlashModel(Qwen3Model):
         if embedding_scale is not None:
             self.gguf_writer.add_embedding_scale(float(embedding_scale))
 
-        target_layer_ids = dflash_config.get("target_layer_ids", [])
+        target_layer_ids = dflash_config.get("target_layer_ids", self.hparams.get("target_layer_ids", []))
         if target_layer_ids:
             extract_layer_ids = [i + 1 for i in target_layer_ids]
             self.gguf_writer.add_target_layers(extract_layer_ids)
@@ -712,8 +719,9 @@ class DFlashModel(Qwen3Model):
         use_sliding_window = self.hparams.get("use_sliding_window", False) or dflash_config.get("use_swa", False)
         sliding_window = dflash_config.get("swa_window_size") or self.hparams.get("sliding_window")
         layer_types = self.hparams.get("layer_types")
-        if use_sliding_window and sliding_window and layer_types:
-            is_swa = [lt == "sliding_attention" for lt in layer_types]
+        if use_sliding_window and sliding_window:
+            is_swa = ([True] * self.block_count if dflash_config.get("use_swa", False)
+                      else [lt == "sliding_attention" for lt in layer_types or []])
             self.gguf_writer.add_sliding_window(sliding_window)
             self.gguf_writer.add_sliding_window_pattern(is_swa)
 
