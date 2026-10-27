@@ -367,6 +367,10 @@ struct split_strategy {
         for (size_t done = 0; done < len; ) {
             const size_t n = (len - done) < chunk ? (len - done) : chunk;
             f_in.read((char *)read_buf.data(), n);
+            if (!f_in) {
+                fprintf(stderr, "%s: failed to read %zu bytes at offset %zu, input file may be truncated\n", __func__, n, in_offset + done);
+                exit(EXIT_FAILURE);
+            }
             f_out.write((const char *)read_buf.data(), n);
             done += n;
         }
@@ -561,6 +565,10 @@ static void gguf_merge(const split_params & split_params) {
             for (size_t done = 0; done < n_bytes; ) {
                 const size_t n = (n_bytes - done) < chunk ? (n_bytes - done) : chunk;
                 f_input.read((char *)read_data.data(), n);
+                if (!f_input) {
+                    fprintf(stderr, "%s: failed to read %zu bytes at offset %zu, input file may be truncated\n", __func__, n, (size_t) offset + done);
+                    exit(EXIT_FAILURE);
+                }
                 if (!split_params.dry_run) {
                     fout.write((const char *)read_data.data(), n);
                 }

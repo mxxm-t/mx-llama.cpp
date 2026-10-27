@@ -342,7 +342,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_inp_engram(const llama_model &
         inp->n_threads = n_threads;
         for (int64_t e = 0; e < n_eng; ++e) {
             const ggml_tensor * table = model.layers[hparams.engram_layer_ids[e]].engram_embed;
-            if (!table || (!hparams.no_alloc && !table->data) || !table->buffer || !ggml_backend_buffer_is_host(table->buffer) ||
+            if (!table || (!model.no_alloc() && !table->data) || !table->buffer || !ggml_backend_buffer_is_host(table->buffer) ||
                     table->type != GGML_TYPE_MXFP4 || table->ne[0] != hparams.engram_head_dim || !ggml_is_contiguous(table)) {
                 throw std::runtime_error("Experimental host Engram inputs require canonical host MXFP4 tables");
             }

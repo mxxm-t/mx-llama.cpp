@@ -13,8 +13,8 @@
 #define LLAMA_MAX_ENGRAM_NGRAM   8
 #define LLAMA_MAX_ENGRAM_COLS   64
 #define LLAMA_MAX_EXPERTS 1024 // Kimi K3
-#define LLAMA_MAX_PLE_NGRAM 8  // qwen4exp
-#define LLAMA_MAX_PLE_HEADS 64 // qwen4exp
+#define LLAMA_MAX_PLE_NGRAM 8  // qwen4exp, deepseek41 (all hash modules)
+#define LLAMA_MAX_PLE_HEADS 64 // qwen4exp, deepseek41 (all hash modules)
 
 enum llama_expert_gating_func_type {
     LLAMA_EXPERT_GATING_FUNC_TYPE_NONE           = 0,
@@ -64,7 +64,6 @@ struct llama_hparams {
     //       for example: n_embd_out() vs n_embd_out_impl
 
     bool vocab_only;
-    bool no_alloc;
     bool rope_finetuned;
     bool use_par_res;
     bool swin_norm;
@@ -143,6 +142,9 @@ struct llama_hparams {
     float f_norm_eps;
     float f_norm_rms_eps;
     float f_norm_group_eps;
+
+    // post norms use their own epsilon
+    float f_post_norm_eps = 0.0f;
 
     float f_attn_logit_softcapping   = 50.0f;
     float f_router_logit_softcapping = 30.0f;
@@ -267,6 +269,12 @@ struct llama_hparams {
     uint32_t dflash_conv_group_size  = 0;
     uint32_t dflash_selector_rank    = 0;
     uint32_t dflash_selector_top_k   = 0;
+    uint32_t lilicorr_hidden_size    = 0;
+    uint32_t lilicorr_candidate_topk = 0;
+    uint32_t lilicorr_num_heads      = 0;
+    uint32_t lilicorr_layers         = 0;
+    float    lilicorr_vector_eps     = 0.0f;
+    float    lilicorr_logit_scale    = 0.0f;
 
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;
@@ -274,6 +282,11 @@ struct llama_hparams {
     uint32_t n_attn_temp_floor_scale = 0;
     float    f_attn_temp_scale       = 0.0f;
     float    f_attn_temp_offset      = 0.0f; // offset position index
+    // use (1 + (pos + offset) / floor_scale) ^ scale instead of the llama4 log form
+    bool     attn_temp_pow           = false;
+
+    // realtime models: number of tokens the output lags behind the audio input
+    uint32_t n_tokens_delay          = 0;
 
     // gemma3n altup
     uint32_t n_altup      = 4; // altup_num_inputs
@@ -315,6 +328,7 @@ struct llama_hparams {
     uint32_t dsv4_o_group_count        = 0;
     uint32_t dsv4_o_lora_rank          = 0;
     uint32_t dsv4_hc_mult              = 0;
+    bool     dsv4_hc_single_pass       = false; // DeepSeek-V4.1 DSpark draft: lagged pre-mix, no hc_head
 
     // DeepSeek-V4.1 Engram: an n-gram hash table written into the residual at a few layers.
     // The primes, multipliers and compressed token map are baked into the GGUF because they come from a sympy prime search, a numpy PCG64 stream and a HuggingFace normalizer chain.
@@ -392,6 +406,13 @@ struct llama_hparams {
     float    dsv4_hc_eps               = 0.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios;
 
+    // deepseek41
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_kv_src;   // layer whose compressed KV this layer reads, -1 = none
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_topk_src; // layer whose top-k this layer uses, -1 = none
+    int32_t  dsv41_cand_src         = -1;    // -1 = no candidate block selection
+    uint32_t dsv41_cand_topk_blocks = 0;
+    uint32_t dsv41_cand_block_size  = 0;
+
     // 0 = full rank (DeepSeek-V4)
     uint32_t hc_low_rank = 0;
 
@@ -406,6 +427,12 @@ struct llama_hparams {
     uint32_t ple_eos_token_id    = 0;
     // the id the PLE hash stands in at image positions; 0 makes the loader fall back to EOS
     uint32_t ple_image_token_id  = 0;
+    // the id the KV cells record at embedding (image) positions for the n-gram history; LLAMA_TOKEN_NULL = none
+    llama_token ple_embd_token   = LLAMA_TOKEN_NULL;
+    // hash constant sets, stored back to back: 1 shared by all PLE layers (qwen4exp), or 1 per PLE layer in layer order (deepseek41)
+    uint32_t ple_n_modules       = 1;
+    // deepseek41 Engram: the token that pads the n-gram history, an index into llama_model::engram_token_map
+    uint32_t engram_pad_id       = 0;
     // the file lists PLE layer indices, so this is never a per-layer gguf array and can hold one bit per layer
     std::bitset<LLAMA_MAX_LAYERS> is_ple_impl;
     // the hash multipliers reach ~2e13 and have to stay 64-bit

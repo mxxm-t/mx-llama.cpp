@@ -1465,7 +1465,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_PRE:
-            case GGML_OP_DSV4_HC_POST: {
+            case GGML_OP_DSV4_HC_POST:
+            case GGML_OP_TOP_K_MASK: {
                 // DeepSeek-V4 custom attention ops. Replicated under design A (mirrored in, mirrored out).
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
@@ -4416,11 +4417,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             backend_ctx->ctx.reset(ggml_init(params));
             for (size_t j = 0; j < n_backends; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
-                // Recreate up to max_subgraphs at max_nnodes capacity, not this graph's
-                // counts: the ctx reset above destroyed every previously created graph,
-                // and a later graph may reuse any index up to the maxima without passing
-                // through this branch again. Fragments hit this (their node and subgraph
-                // counts vary independently), whole graphs raise both maxima together.
                 for (size_t i = 0; i < backend_ctx->max_subgraphs; i++) {
                     bcj.cgraphs[i].cgraph_main = ggml_new_graph_custom(backend_ctx->ctx.get(), backend_ctx->max_nnodes, /*grads =*/ false);
                 }
