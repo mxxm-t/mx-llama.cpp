@@ -132,7 +132,16 @@ __device__ void group_mask_warp_inplace(float (&vals)[experts_per_thread], const
         const float other = __shfl_sync(0xFFFFFFFF, score, g, WARP_SIZE);
         rank += other > score || (other == score && g < lane);
     }
+#if defined(GGML_USE_HIP)
+    // A row is WARP_SIZE = 32 lanes, so on a 64-wide wavefront (GCN, CDNA) two rows share one ballot, and HIP's
+    // __ballot_sync ANDs the result with its mask, so a 0xFFFFFFFF mask also drops the second row's bits.
+    // Take the ballot of the whole wavefront and shift this row's bits down from its first lane.
+    constexpr int            phys_warp_size = ggml_cuda_get_physical_warp_size();
+    const int                row_lane0      = (int) ((threadIdx.y*blockDim.x + threadIdx.x) % phys_warp_size) - lane;
+    const unsigned long long keep           = __ballot(lane < n_groups && rank < n_group_used) >> row_lane0;
+#else
     const auto keep = __ballot_sync(0xFFFFFFFFULL, lane < n_groups && rank < n_group_used);
+#endif // defined(GGML_USE_HIP)
 
 #pragma unroll
     for (int i = 0; i < experts_per_thread; i++) {
