@@ -1,6 +1,7 @@
 #include "gated_delta_net.cuh"
 #include "gated_delta_net_chunk.cuh"
 #include "gated-delta-net-mma.cuh"
+#include "gated_delta_net_colthread.cuh"
 #include "ggml-cuda/common.cuh"
 
 #include <cstdint>
@@ -191,6 +192,12 @@ static void launch_gated_delta_net(
         int64_t neqk1, int64_t rq3,
         float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
     const int CS = KDA ? 16 : 64;
+
+    if (launch_gated_delta_net_colthread<KDA, keep_rs_t>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+            sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream)) {
+        return;
+    }
 
     // The chunked kernel emits per-token snapshots, so retained-state prefill no longer needs serial arithmetic.
     // The opt-out is for diagnosis and does not change ring-off calls.
