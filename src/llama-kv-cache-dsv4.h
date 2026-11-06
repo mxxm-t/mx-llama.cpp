@@ -100,7 +100,6 @@ public:
                      uint32_t   kv_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_ubatch,
-                     uint32_t   n_pad,
                      uint32_t   n_rs_seq,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
@@ -152,7 +151,7 @@ public:
 
     uint32_t get_n_rs_seq() const;
     const std::vector<uint32_t> & get_rs_idx() const;
-    void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
+    void update_rs_for_ubatches(const std::vector<llama_ubatch> & ubatches);
 
 private:
     llama_hparams hparams_raw;
@@ -164,6 +163,10 @@ private:
     const uint32_t n_rs_seq;
 
     std::vector<uint32_t> rs_idx;
+
+    // [n_seq_max] largest rollback whose snapshot the last ubatch of the seq wrote: snapshot d is
+    // exact for d <= n tokens of the seq in that ubatch (d == n is the state before the ubatch)
+    std::vector<uint32_t> rs_max;
 
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
     std::unique_ptr<llama_kv_cache>      kv_csa;
@@ -210,11 +213,10 @@ public:
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
 
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
-    ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
+    std::vector<ggml_tensor *> get_k_rot() const;
 
     void set_input_k_idxs(ggml_tensor * dst) const;
-    void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
-    void set_input_k_rot(ggml_tensor * dst) const;
+    void set_input_attn_mask(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
 
     // see llama_kv_cache::get_prev_tokens() - the n-gram hash of the engram needs the tokens before each position, and the sliding-window cells are where DSV4 keeps them
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
@@ -263,8 +265,7 @@ public:
     ggml_tensor * get_k_replica(ggml_context * ctx, int32_t ir) const;
     ggml_tensor * cpy_k_replica(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t ir) const;
 
-    ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
-    void set_input_k_rot(ggml_tensor * dst) const;
+    std::vector<ggml_tensor *> get_k_rot() const;
 
 private:
     llama_kv_cache * kv;

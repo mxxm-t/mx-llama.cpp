@@ -421,10 +421,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_engram(
     return ggml_add(ctx0, x, out);
 }
 
-llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_params & params)
-    : llama_model_deepseek4::graph(model, params) {
+llama_model_deepseek41::graph::graph(const llm_graph_params & params)
+    : llama_model_deepseek4::graph(params) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_deepseek41::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<llama_model_deepseek41::graph>(*this, params);
+    return std::make_unique<llama_model_deepseek41::graph>(params);
 }

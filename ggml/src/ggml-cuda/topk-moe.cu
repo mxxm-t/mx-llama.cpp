@@ -234,6 +234,9 @@ __global__ void topk_moe_cuda(const float *         logits,
             const int expert = i + threadIdx.x;
             selection_wt[i / WARP_SIZE] =
                 (n_experts % WARP_SIZE == 0 || expert < n_experts) ? wt[i / WARP_SIZE] + bias[expert] : -INFINITY;
+            if (__isnanf(selection_wt[i / WARP_SIZE])) {
+                selection_wt[i / WARP_SIZE] = -FLT_MAX;
+            }
         }
     }
 
@@ -432,7 +435,7 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
             ggml_cuda_kernel_launch(topk_moe_cuda<288, has_bias>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
-        case 384: // DeepSeek-V4.1-Flash
+        case 384: // DeepSeek V4.1
             ggml_cuda_kernel_launch(topk_moe_cuda<384, has_bias>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
