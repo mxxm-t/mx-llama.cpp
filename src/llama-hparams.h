@@ -9,12 +9,9 @@
 
 // bump if necessary
 #define LLAMA_MAX_LAYERS  512
-#define LLAMA_MAX_ENGRAM_LAYERS  8
-#define LLAMA_MAX_ENGRAM_NGRAM   8
-#define LLAMA_MAX_ENGRAM_COLS   64
 #define LLAMA_MAX_EXPERTS 1024 // Kimi K3
-#define LLAMA_MAX_PLE_NGRAM 8  // qwen4exp
-#define LLAMA_MAX_PLE_HEADS 64 // qwen4exp
+#define LLAMA_MAX_PLE_NGRAM 8  // qwen4exp, deepseek41 (all hash modules)
+#define LLAMA_MAX_PLE_HEADS 64 // qwen4exp, deepseek41 (all hash modules)
 
 enum llama_expert_gating_func_type {
     LLAMA_EXPERT_GATING_FUNC_TYPE_NONE           = 0,
@@ -37,6 +34,7 @@ enum llama_non_causal_type {
     LLAMA_NON_CAUSAL_TYPE_ALL      = 0, // all layers non-causal, SWA still applied (gemma 3, qwen-vl, ...)
     LLAMA_NON_CAUSAL_TYPE_SWA_ONLY = 1, // SWA layers non-causal, dense layers stay causal (gemma 4)
     LLAMA_NON_CAUSAL_TYPE_SWA_FULL = 2, // all layers non-causal, SWA not applied between tokens of the current ubatch (deepseek 4)
+    LLAMA_NON_CAUSAL_TYPE_DENSE_ONLY = 3, // dense layers non-causal, SWA layers stay causal (lfm3 d1)
 };
 
 // M-RoPE: which input position slot feeds each RoPE section
@@ -64,7 +62,6 @@ struct llama_hparams {
     //       for example: n_embd_out() vs n_embd_out_impl
 
     bool vocab_only;
-    bool no_alloc;
     bool rope_finetuned;
     bool use_par_res;
     bool swin_norm;
@@ -87,6 +84,9 @@ struct llama_hparams {
 
     // TODO: this needs to be reworked
     int32_t  n_layer_kv_from_start = -1; // if non-negative, the first n_layer_kv_from_start layers have KV cache
+
+    // layer il reads the KV cache of layer kv_source_impl[il] (own cache if equal to il)
+    std::array<uint32_t, LLAMA_MAX_LAYERS> kv_source_impl;
 
     // different head size for full_attention and SWA layers
     uint32_t n_embd_head_k_full; // dimension of keys (d_k). d_q is assumed to be the same, but there are n_head q heads, and only n_head_kv k-v heads
@@ -143,6 +143,9 @@ struct llama_hparams {
     float f_norm_eps;
     float f_norm_rms_eps;
     float f_norm_group_eps;
+
+    // post norms use their own epsilon
+    float f_post_norm_eps = 0.0f;
 
     float f_attn_logit_softcapping   = 50.0f;
     float f_router_logit_softcapping = 30.0f;
@@ -206,6 +209,7 @@ struct llama_hparams {
     uint32_t ssm_d_state = 0;
     uint32_t ssm_dt_rank = 0;
     uint32_t ssm_n_group = 0;
+    float    ssm_norm_eps = 0.0f; // 0 = use f_norm_rms_eps
 
     // for MiniMax-Text-01 linear attention
     uint32_t n_embd_head_la = 0;
@@ -226,6 +230,20 @@ struct llama_hparams {
     uint32_t n_hrm_h_cycles = 0;
     uint32_t n_hrm_l_cycles = 0;
     bool     hrm_prefix_lm = false;
+
+    // metis16 (passes over shared layers, depth memory)
+    uint32_t metis_n_pass         = 0;
+    uint32_t metis_n_mem          = 0;
+    uint32_t metis_n_route        = 0;
+    uint32_t metis_pass_lora_rank = 0;
+    float    metis_cont_limit     = 0.0f;
+
+    // limite
+    float    f_xsa_eps = 0.0f;
+    std::array<float, 3> final_logit_sigmoid_capping = {}; // scale, shift, temperature
+    uint32_t n_mudd_ff   = 0;
+    uint32_t n_mudd_taps = 0;
+    std::array<int32_t, LLAMA_MAX_LAYERS> mudd_tap_idx; // [n_layer][n_mudd_taps], -1 = no mixing
 
     bool ssm_dt_b_c_rms = false;
 
@@ -267,6 +285,12 @@ struct llama_hparams {
     uint32_t dflash_conv_group_size  = 0;
     uint32_t dflash_selector_rank    = 0;
     uint32_t dflash_selector_top_k   = 0;
+    uint32_t lilicorr_hidden_size    = 0;
+    uint32_t lilicorr_candidate_topk = 0;
+    uint32_t lilicorr_num_heads      = 0;
+    uint32_t lilicorr_layers         = 0;
+    float    lilicorr_vector_eps     = 0.0f;
+    float    lilicorr_logit_scale    = 0.0f;
 
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;
@@ -274,6 +298,11 @@ struct llama_hparams {
     uint32_t n_attn_temp_floor_scale = 0;
     float    f_attn_temp_scale       = 0.0f;
     float    f_attn_temp_offset      = 0.0f; // offset position index
+    // use (1 + (pos + offset) / floor_scale) ^ scale instead of the llama4 log form
+    bool     attn_temp_pow           = false;
+
+    // realtime models: number of tokens the output lags behind the audio input
+    uint32_t n_tokens_delay          = 0;
 
     // gemma3n altup
     uint32_t n_altup      = 4; // altup_num_inputs
@@ -315,82 +344,19 @@ struct llama_hparams {
     uint32_t dsv4_o_group_count        = 0;
     uint32_t dsv4_o_lora_rank          = 0;
     uint32_t dsv4_hc_mult              = 0;
-
-    // DeepSeek-V4.1 Engram: an n-gram hash table written into the residual at a few layers.
-    // The primes, multipliers and compressed token map are baked into the GGUF because they come from a sympy prime search, a numpy PCG64 stream and a HuggingFace normalizer chain.
-    uint32_t engram_head_dim           = 0;
-    uint32_t engram_n_heads            = 0;
-    uint32_t engram_max_ngram_size     = 0;
-    uint32_t engram_pad_token_id       = 0;
-    uint32_t engram_compressed_vocab   = 0;
-    // llama_hparams must stay trivially copyable, so these are bounded arrays and the vocab-sized token map lives on the model instead.
-    // V4.1 keeps the KV compressor and the indexer on source layers that other layers reuse.
-    // The compressed tiers, by ratio.
-    // V4 runs 4 (with an indexer) and 128; V4.1 runs 2 and 1.
-    // Ratio 1 pools a single token, where the pooling softmax is the identity, so that tier needs no gate and its source layer ships no attn_comp_wgate.
-    uint32_t dsv4_ratio_idx            = 4;
-    uint32_t dsv4_ratio_plain          = 128;
-
-    uint32_t dsv41_n_kv_source         = 0;
-    uint32_t dsv41_n_index_source      = 0;
-    uint32_t dsv41_candidate_src_layer = 0;
-    uint32_t dsv41_candidate_block     = 0;
-    uint32_t dsv41_candidate_topk      = 0;
-    std::array<uint32_t, LLAMA_MAX_LAYERS> dsv41_kv_source_layers    = {};
-    std::array<uint32_t, LLAMA_MAX_LAYERS> dsv41_index_source_layers = {};
-
-    bool dsv41_is_kv_source(uint32_t il) const {
-        for (uint32_t i = 0; i < dsv41_n_kv_source; ++i) {
-            if (dsv41_kv_source_layers[i] == il) { return true; }
-        }
-        return false;
-    }
-
-    // The nearest KV source at or before il, whose compressed cache this layer reads.
-    // V4 compresses on every ratio layer and has no source list, so it gets -1 and is its own.
-    int dsv41_kv_source_for(uint32_t il) const {
-        int best = -1;
-        for (uint32_t i = 0; i < dsv41_n_kv_source; ++i) {
-            const int s = (int) dsv41_kv_source_layers[i];
-            if (s <= (int) il && s > best) {
-                best = s;
-            }
-        }
-        return best;
-    }
-
-    bool dsv41_is_index_source(uint32_t il) const {
-        for (uint32_t i = 0; i < dsv41_n_index_source; ++i) {
-            if (dsv41_index_source_layers[i] == il) { return true; }
-        }
-        return false;
-    }
-
-    uint32_t engram_n_layers           = 0;
-    std::array<uint32_t, LLAMA_MAX_ENGRAM_LAYERS> engram_layer_ids      = {};
-    std::array<uint64_t, LLAMA_MAX_ENGRAM_LAYERS> engram_num_embeddings = {};
-    std::array<uint64_t, LLAMA_MAX_ENGRAM_LAYERS*LLAMA_MAX_ENGRAM_NGRAM> engram_multipliers = {};
-    std::array<uint64_t, LLAMA_MAX_ENGRAM_LAYERS*LLAMA_MAX_ENGRAM_COLS>  engram_primes      = {};
-    std::array<uint64_t, LLAMA_MAX_ENGRAM_LAYERS*LLAMA_MAX_ENGRAM_COLS>  engram_offsets     = {};
-
-    // index of il in engram_layer_ids, or -1 when the layer carries no engram table
-    int engram_layer_index(uint32_t il) const {
-        for (uint32_t i = 0; i < engram_n_layers; ++i) {
-            if (engram_layer_ids[i] == il) {
-                return (int) i;
-            }
-        }
-        return -1;
-    }
-
-    uint32_t engram_n_hash_cols() const {
-        return engram_max_ngram_size > 0 ? (engram_max_ngram_size - 1) * engram_n_heads : 0;
-    }
+    bool     dsv4_hc_single_pass       = false; // DeepSeek-V4.1 DSpark draft: lagged pre-mix, no hc_head
     uint32_t dsv4_hc_sinkhorn_iters    = 0;
     uint32_t dsv4_hash_layer_count     = 0;
     float    dsv4_compress_rope_base   = 0.0f;
     float    dsv4_hc_eps               = 0.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios;
+
+    // deepseek41
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_kv_src;   // layer whose compressed KV this layer reads, -1 = none
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_topk_src; // layer whose top-k this layer uses, -1 = none
+    int32_t  dsv41_cand_src         = -1;    // -1 = no candidate block selection
+    uint32_t dsv41_cand_topk_blocks = 0;
+    uint32_t dsv41_cand_block_size  = 0;
 
     // 0 = full rank (DeepSeek-V4)
     uint32_t hc_low_rank = 0;
@@ -406,6 +372,12 @@ struct llama_hparams {
     uint32_t ple_eos_token_id    = 0;
     // the id the PLE hash stands in at image positions; 0 makes the loader fall back to EOS
     uint32_t ple_image_token_id  = 0;
+    // the id the KV cells record at embedding (image) positions for the n-gram history; LLAMA_TOKEN_NULL = none
+    llama_token ple_embd_token   = LLAMA_TOKEN_NULL;
+    // hash constant sets, stored back to back: 1 shared by all PLE layers (qwen4exp), or 1 per PLE layer in layer order (deepseek41)
+    uint32_t ple_n_modules       = 1;
+    // deepseek41 Engram: the token that pads the n-gram history, an index into llama_model::engram_token_map
+    uint32_t engram_pad_id       = 0;
     // the file lists PLE layer indices, so this is never a per-layer gguf array and can hold one bit per layer
     std::bitset<LLAMA_MAX_LAYERS> is_ple_impl;
     // the hash multipliers reach ~2e13 and have to stay 64-bit
@@ -553,6 +525,8 @@ struct llama_hparams {
     uint32_t n_embd_head_v_mla() const;
 
     bool has_kv(uint32_t il) const;
+
+    uint32_t kv_source(uint32_t il) const;
 
     bool has_rope(uint32_t il) const;
 
