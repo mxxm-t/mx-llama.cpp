@@ -576,9 +576,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
         ggml_tensor * Vc = build_lora_mm(layer.wv, cur, layer.wv_s);
         Vc = ggml_reshape_3d(ctx0, Vc, n_embd_head, n_head_kv, n_tokens);
 
-        Kc = ggml_rope_multi(ctx0, Kc, inp_pos, nullptr,
-                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-                ext_factor, attn_factor, beta_fast, beta_slow);
+        Kc = build_rope(Kc, inp_pos, il);
 
         build_attn_store_kv(inp_attn, Kc, Vc, il);
 
