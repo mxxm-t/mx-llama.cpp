@@ -4267,7 +4267,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                 if (other != nullptr &&
                                         ggml_backend_meta_get_split_state(other, false).axis ==
                                         GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
-                                    i_delayed = k;
+                                    // The zero-slice rule below clears the compute flag on every node up to i_delayed on a lane where node i holds a zero slice.
+                                    // Folding across the other operand's producer chain would clear that lane's share of the other branch as well.
+                                    // So fold only when both operands are computed on the same lanes, as get_i_delayed does for its own fold.
+                                    bool same_lanes = true;
+                                    for (size_t j = 0; j < n_backends && same_lanes; j++) {
+                                        const bool c_node  = backend_ctx->backend_configs[j].nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE;
+                                        const bool c_other = ggml_backend_meta_buffer_simple_tensor(other, j)->flags & GGML_TENSOR_FLAG_COMPUTE;
+                                        same_lanes = c_node == c_other;
+                                    }
+                                    if (same_lanes) {
+                                        i_delayed = k;
+                                    }
                                 }
                             }
                             break;
