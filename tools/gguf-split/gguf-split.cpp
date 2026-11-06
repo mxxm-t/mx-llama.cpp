@@ -367,6 +367,10 @@ struct split_strategy {
         for (size_t done = 0; done < len; ) {
             const size_t n = (len - done) < chunk ? (len - done) : chunk;
             f_in.read((char *)read_buf.data(), n);
+            if (!f_in) {
+                fprintf(stderr, "%s: failed to read %zu bytes at offset %zu, input file may be truncated\n", __func__, n, in_offset + done);
+                exit(EXIT_FAILURE);
+            }
             f_out.write((const char *)read_buf.data(), n);
             done += n;
         }
@@ -457,6 +461,17 @@ static void gguf_merge(const split_params & split_params) {
         ctx_ggufs.push_back(ctx_gguf);
         ctx_metas.push_back(ctx_meta);
 
+        // Verify that this split belongs to the same set as the first one
+        if (i_split > 0) {
+            auto key_split_no    = gguf_find_key(ctx_gguf, LLM_KV_SPLIT_NO);
+            auto key_split_count = gguf_find_key(ctx_gguf, LLM_KV_SPLIT_COUNT);
+            if (key_split_no < 0 || gguf_get_val_u16(ctx_gguf, key_split_no) != i_split ||
+                key_split_count < 0 || gguf_get_val_u16(ctx_gguf, key_split_count) != n_split) {
+                fprintf(stderr, "\n%s: %s is not split %d of %d\n", __func__, split_path, i_split + 1, n_split);
+                exit(EXIT_FAILURE);
+            }
+        }
+
         if (i_split == 0) {
             auto key_n_split = gguf_find_key(ctx_gguf, LLM_KV_SPLIT_COUNT);
             if (key_n_split < 0) {
@@ -511,6 +526,14 @@ static void gguf_merge(const split_params & split_params) {
 
         fprintf(stderr, "\033[3Ddone\n");
     }
+
+    // Verify that no tensor is missing
+    auto key_n_tensors = gguf_find_key(ctx_ggufs[0], LLM_KV_SPLIT_TENSORS_COUNT);
+    if (key_n_tensors < 0 || gguf_get_val_i32(ctx_ggufs[0], key_n_tensors) != total_tensors) {
+        fprintf(stderr, "%s: splits contain %d tensors, which does not match %s\n", __func__, total_tensors, LLM_KV_SPLIT_TENSORS_COUNT);
+        exit(EXIT_FAILURE);
+    }
+
     std::ofstream fout;
     if (!split_params.dry_run) {
         fout.open(split_params.output.c_str(), std::ios::binary);
@@ -561,6 +584,10 @@ static void gguf_merge(const split_params & split_params) {
             for (size_t done = 0; done < n_bytes; ) {
                 const size_t n = (n_bytes - done) < chunk ? (n_bytes - done) : chunk;
                 f_input.read((char *)read_data.data(), n);
+                if (!f_input) {
+                    fprintf(stderr, "%s: failed to read %zu bytes at offset %zu, input file may be truncated\n", __func__, n, (size_t) offset + done);
+                    exit(EXIT_FAILURE);
+                }
                 if (!split_params.dry_run) {
                     fout.write((const char *)read_data.data(), n);
                 }
