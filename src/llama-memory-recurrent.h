@@ -16,6 +16,9 @@
 //       see the implementation of llama_kv_cache_context_i for an example how to do it
 class llama_memory_recurrent : public llama_memory_i {
 public:
+    // true if the per-token snapshot ring is active
+    bool uses_ring() const { return ring_enabled; }
+
     llama_memory_recurrent(
             const llama_model & model,
                          bool   no_alloc,
@@ -225,6 +228,9 @@ private:
     llama_memory_recurrent * mem;
 
     size_t i_next = 0;
+
+    // the ubatch index plan_snapshot_writes last ran for, it must run once per ubatch
+    mutable int64_t i_planned = -1;
 
     std::vector<llama_ubatch> ubatches;
 

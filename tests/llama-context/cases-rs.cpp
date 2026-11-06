@@ -281,10 +281,53 @@ struct case_rollback : ctx_test {
                     "replay logits mismatch at position " + std::to_string(pos) + ", nmse " + std::to_string(diff.nmse()));
         }
 
-        // the replay ran in single-token ubatches, which hold no snapshot that deep
-        CTX_REQUIRE(!llama_memory_seq_rm(llama_get_memory(ctx_src.get()), 0, rollback_pos, -1) &&
-                    !llama_memory_seq_rm(llama_get_memory(ctx_dst.get()), 0, rollback_pos, -1),
-                "a rollback past the snapshots of single-token ubatches was accepted");
+        // upstream refuses a rollback past the snapshots of the last ubatch
+        // the snapshot ring keeps older snapshots, so there a deep rollback may be accepted if the replay then matches a fresh context
+        if (!llama_memory_rs_ring_active(ctx_src.get())) {
+            CTX_REQUIRE(!llama_memory_seq_rm(llama_get_memory(ctx_src.get()), 0, rollback_pos, -1) &&
+                        !llama_memory_seq_rm(llama_get_memory(ctx_dst.get()), 0, rollback_pos, -1),
+                    "a rollback past the snapshots of single-token ubatches was accepted");
+        } else {
+            llama_context_ptr ctx_fresh = make_rs_ctx();
+            if (!ctx_fresh) {
+                return case_result::fail();
+            }
+            const llama_tokens prefix(tokens.begin(), tokens.begin() + rollback_pos);
+            if (!decode_tokens(ctx_fresh.get(), prefix)) {
+                TLOG_ERR("%s: failed to decode the fresh prefix\n", __func__);
+                return case_result::fail();
+            }
+
+            std::vector<std::vector<float>> logits_fresh(n_rollback);
+            for (uint32_t i = 0; i < n_rollback; ++i) {
+                const llama_pos pos = rollback_pos + i;
+                const float * l = decode_one(ctx_fresh.get(), tokens[pos], pos) ? llama_get_logits_ith(ctx_fresh.get(), 0) : nullptr;
+                if (l == nullptr) {
+                    TLOG_ERR("%s: fresh replay failed at position %d\n", __func__, pos);
+                    return case_result::fail();
+                }
+                logits_fresh[i].assign(l, l + n_vocab);
+            }
+
+            // the fresh context ran the prefix in other ubatches, so allow the usual drift
+            constexpr float nmse_deep = 1e-4f;
+
+            for (llama_context * c : { ctx_src.get(), ctx_dst.get() }) {
+                if (!llama_memory_seq_rm(llama_get_memory(c), 0, rollback_pos, -1)) {
+                    continue;
+                }
+                for (uint32_t i = 0; i < n_rollback; ++i) {
+                    const llama_pos pos = rollback_pos + i;
+                    const float * l = decode_one(c, tokens[pos], pos) ? llama_get_logits_ith(c, 0) : nullptr;
+                    CTX_REQUIRE(l != nullptr, "the replay after a ring rollback failed at position " + std::to_string(pos));
+
+                    const logits_diff diff = compare_logits(l, logits_fresh[i].data(), n_vocab);
+                    CTX_REQUIRE(diff.nmse() <= nmse_deep,
+                            "ring rollback replay differs from a fresh context at position " + std::to_string(pos) +
+                            ", nmse " + std::to_string(diff.nmse()));
+                }
+            }
+        }
 
         // Repeat the load into a context that already has its own rollback state:
         // groups 1..n_rs_seq hold a different prompt's history, and rs_idx[0] is
@@ -393,9 +436,47 @@ struct case_rollback_bound : ctx_test {
                         decode_gen(ctx.get(), n_vocab, 0, n_prefix, pos_end),
                     "the prefix / ubatch decode failed");
 
-            for (uint32_t r = n_rs_seq + 1; r > r_max; --r) {
-                CTX_REQUIRE(!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, pos_end - (llama_pos) r, -1),
-                        "rollback " + std::to_string(r) + " after a " + std::to_string(n) + "-token ubatch was accepted");
+            // the ring keeps older snapshots, so it may accept rollbacks upstream refuses
+            // each such rollback must then replay like a fresh context that decoded up to the rollback point
+            const bool ring = llama_memory_rs_ring_active(ctx.get());
+
+            if (!ring) {
+                for (uint32_t r = n_rs_seq + 1; r > r_max; --r) {
+                    CTX_REQUIRE(!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, pos_end - (llama_pos) r, -1),
+                            "rollback " + std::to_string(r) + " after a " + std::to_string(n) + "-token ubatch was accepted");
+                }
+            } else {
+                for (uint32_t r = n_rs_seq + 1; r > r_max; --r) {
+                    ctx = make_ctx();
+                    CTX_REQUIRE(ctx && decode_gen(ctx.get(), n_vocab, 0, 0, n_prefix) &&
+                                decode_gen(ctx.get(), n_vocab, 0, n_prefix, pos_end),
+                            "the prefix / ubatch decode failed");
+
+                    const llama_pos p_roll = pos_end - (llama_pos) r;
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, p_roll, -1)) {
+                        continue;
+                    }
+
+                    llama_context_ptr ctx_ref = make_ctx();
+                    CTX_REQUIRE(ctx_ref && (p_roll == 0 || decode_gen(ctx_ref.get(), n_vocab, 0, 0, p_roll)),
+                            "the reference prefix decode failed");
+
+                    // decode the same next token in both and compare
+                    const llama_token t = gen_token(n_vocab, 0, p_roll);
+                    const float * l_roll = decode_one(ctx.get(),     t, p_roll) ? llama_get_logits_ith(ctx.get(),     0) : nullptr;
+                    const float * l_ref  = decode_one(ctx_ref.get(), t, p_roll) ? llama_get_logits_ith(ctx_ref.get(), 0) : nullptr;
+                    CTX_REQUIRE(l_roll != nullptr && l_ref != nullptr, "the decode after a ring rollback failed");
+
+                    const logits_diff diff = compare_logits(l_roll, l_ref, n_vocab);
+                    CTX_REQUIRE(diff.nmse() <= 1e-4f,
+                            "ring rollback " + std::to_string(r) + " after a " + std::to_string(n) + "-token ubatch differs from a fresh context, nmse " +
+                            std::to_string(diff.nmse()));
+                }
+                // the context state above was replaced, so the guaranteed rollback below needs its own context
+                ctx = make_ctx();
+                CTX_REQUIRE(ctx && decode_gen(ctx.get(), n_vocab, 0, 0, n_prefix) &&
+                            decode_gen(ctx.get(), n_vocab, 0, n_prefix, pos_end),
+                        "the prefix / ubatch decode failed");
             }
 
             if (r_max > 0) {

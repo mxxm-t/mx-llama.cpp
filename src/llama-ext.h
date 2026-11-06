@@ -35,6 +35,9 @@ LLAMA_API bool llama_arch_supports_mixed_batch(llm_arch arch);
 // FIXME temporary function for better error messages
 LLAMA_API bool llama_arch_supports_save(llm_arch arch);
 
+// true if the context keeps a per-token recurrent snapshot ring, so rollbacks can go deeper than the last ubatch
+LLAMA_API bool llama_memory_rs_ring_active(const struct llama_context * ctx);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,

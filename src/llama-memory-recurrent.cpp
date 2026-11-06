@@ -17,6 +17,33 @@
 // llama_memory_recurrent
 //
 
+// the ring needs every snapshot slot written by the delta-net kernels, verified on CPU and CUDA/HIP only
+static bool ring_backend_ok(ggml_backend_dev_t dev) {
+    if (!dev) {
+        return true;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    const char * name = reg ? ggml_backend_reg_name(reg) : "";
+    return strcmp(name, "CPU") == 0 || strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0 || strcmp(name, "Meta") == 0;
+}
+
+static bool ring_backends_ok(const llama_model & model, bool offload) {
+    if (!offload) {
+        return true;
+    }
+    for (const auto & d : model.devices) {
+        if (!d.is_meta && !ring_backend_ok(d.dev)) {
+            return false;
+        }
+    }
+    for (int il = 0; il < (int) model.hparams.n_layer(); il++) {
+        if (!ring_backend_ok(model.dev_layer(il))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 llama_memory_recurrent::llama_memory_recurrent(
         const llama_model & model,
                  bool   no_alloc,
@@ -44,6 +71,10 @@ llama_memory_recurrent::llama_memory_recurrent(
             // Preserving all of its historical ring planes across that move needs a multi-sequence copy planner.
             // until that exists, keep the proven plane-indexed path for parallel contexts instead of advertising history which remains in the source cell.
             ring_enabled = n_rs_seq > 0 && n_seq_max == 1;
+            if (ring_enabled && !ring_backends_ok(model, offload)) {
+                LLAMA_LOG_INFO("%s: snapshot ring disabled, the model runs on a backend where it is not verified\n", __func__);
+                ring_enabled = false;
+            }
             break;
         default:
             ring_enabled = false;
@@ -574,6 +605,9 @@ void llama_memory_recurrent_context::plan_snapshot_writes(
         int32_t * dst, uint32_t n_seqs, uint32_t n_snap) const {
     GGML_ASSERT(mem->ring_enabled);
     GGML_ASSERT(dst != nullptr);
+    // a second plan for the same ubatch would advance the rings twice
+    GGML_ASSERT(i_planned != (int64_t) i_next);
+    i_planned = (int64_t) i_next;
     GGML_ASSERT(n_snap > 0 && n_snap <= mem->n_planes());
     GGML_ASSERT(mem->head + n_seqs <= mem->cells.size());
 

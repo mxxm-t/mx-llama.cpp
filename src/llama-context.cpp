@@ -7,6 +7,9 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-recurrent.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -5051,6 +5054,22 @@ uint32_t llama_n_seq_max(const llama_context * ctx) {
 
 uint32_t llama_n_rs_seq(const llama_context * ctx) {
     return ctx->get_cparams().n_rs_seq;
+}
+
+bool llama_memory_rs_ring_active(const llama_context * ctx) {
+    llama_memory_t mem = ctx->get_memory();
+    if (!mem) {
+        return false;
+    }
+    const llama_memory_recurrent * recr = dynamic_cast<const llama_memory_recurrent *>(mem);
+    if (!recr) {
+        if (auto * hyb = dynamic_cast<const llama_memory_hybrid *>(mem)) {
+            recr = hyb->get_mem_recr();
+        } else if (auto * hyb_iswa = dynamic_cast<const llama_memory_hybrid_iswa *>(mem)) {
+            recr = hyb_iswa->get_mem_recr();
+        }
+    }
+    return recr && recr->uses_ring();
 }
 
 const llama_model * llama_get_model(const llama_context * ctx) {
