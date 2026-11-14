@@ -53,8 +53,8 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
         const int si1  = ids->nb[1] / sizeof(int32_t);
         const int sis1 = src1->nb[2] / src1->nb[1];
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data,
-            ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, n_tokens, n_expert_used, src1->ne[1], si1, sis1, false, stream);
+            ids_src1.get(), ids_dst.get(), /*tile_spec =*/ nullptr,
+            ne02, n_tokens, n_expert_used, src1->ne[1], /*tile_width =*/ 1, si1, sis1, false, stream, expert_bounds.get());
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -533,8 +533,8 @@ void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
         const int si1  = ids->nb[1] / sizeof(int32_t);
         const int sis1 = src1->nb[2] / src1->nb[1];
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data,
-            ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, n_tokens, n_expert_used, src1->ne[1], si1, sis1, false, stream);
+            ids_src1.get(), ids_dst.get(), /*tile_spec =*/ nullptr,
+            ne02, n_tokens, n_expert_used, src1->ne[1], /*tile_width =*/ 1, si1, sis1, false, stream, expert_bounds.get());
         CUDA_CHECK(cudaGetLastError());
 
         const dim3 grid_nc((ne01 + 3) / 4, (unsigned) n_assign, 1);

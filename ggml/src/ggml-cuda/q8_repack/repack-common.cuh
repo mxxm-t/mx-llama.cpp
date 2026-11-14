@@ -623,8 +623,8 @@ void repack_view_cache_purge(int device, const void * base, size_t size);
 // same activation was already quantized to this exact layout. One activation
 // feeds several matmuls back to back - q/k/v off one attention norm, router and
 // routed gate/up off one ffn norm - and each re-quantized its own copy, so the
-// launch count tracked the matmul count exactly. quantize_row_q8_1_cuda ignores
-// type_src0 and always writes the plain row layout, so variant 0 is the same
+// launch count tracked the matmul count exactly. quantize_row_q8_1_cuda
+// always writes the plain row layout, so variant 0 is the same
 // layout the canonical mat-vec caches under and the two share entries. The MoE
 // sites pass the rows flattened as (n_cols, 1, 1) where the dense sites pass
 // (ne11, ne12, ne13). That is still the same bytes: the kernel writes
@@ -649,8 +649,9 @@ static inline block_q8_1 * repack_quantize_src1_q8_1(
         dstq = fallback.get();
     }
     if (!hit) {
-        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, dstq,
-            src0->type, ne10, s11, s12, s13, ne10_padded, nrows, ne2, ne3, stream);
+        quantize_row_q8_1_cuda((const float *) src1->data, dstq,
+            ne10, s11, s12, s13, ne10_padded, nrows, ne2, ne3, stream);
+        GGML_UNUSED(src0);
     }
     return dstq;
 }

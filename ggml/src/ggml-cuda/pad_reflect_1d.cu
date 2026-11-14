@@ -79,13 +79,25 @@ void ggml_cuda_op_pad_reflect_1d(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     constexpr int64_t bx     = CUDA_PAD_REFLECT_1D_BLOCK_SIZE;  // threads per block (x)
     const int64_t     tiles0 = (ne0 + bx - 1) / bx;             // number of tiles along i0
-    // grid.x covers i1 and all tiles of i0: [ne01 * tiles0]
-    // grid.y covers i2: [ne02]
-    // grid.z covers i3: [ne03]
-    const dim3        grid_dims((unsigned) (ne01 * tiles0), (unsigned) ne02, (unsigned) ne03);
     const dim3        block_dims((unsigned) bx, 1, 1);
 
-    pad_reflect_1d_kernel_f32<<<grid_dims, block_dims, 0, stream>>>(
-        src0->data, dst->data, ne0, ne00, ne01_packed, ne02, ne03, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
-        dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3], p0, p1);
+#if defined(GGML_USE_HIP)
+    // HIP rejects a launch with 2^32 or more threads along one grid dimension, so many rows take more than one launch
+    const int64_t rows_max = std::max<int64_t>(1, INT32_MAX / (bx * tiles0));
+#else
+    const int64_t rows_max = ne01;
+#endif // defined(GGML_USE_HIP)
+
+    for (int64_t i1 = 0; i1 < ne01; i1 += rows_max) {
+        const int64_t rows        = std::min(rows_max, ne01 - i1);
+        const uint3   rows_packed = rows == ne01 ? ne01_packed : init_fastdiv_values(rows);
+        // grid.x covers the rows of this launch and all tiles of i0: [rows * tiles0]
+        // grid.y covers i2: [ne02]
+        // grid.z covers i3: [ne03]
+        const dim3 grid_dims((unsigned) (rows * tiles0), (unsigned) ne02, (unsigned) ne03);
+
+        pad_reflect_1d_kernel_f32<<<grid_dims, block_dims, 0, stream>>>(
+            (const char *) src0->data + i1 * src0->nb[1], (char *) dst->data + i1 * dst->nb[1], ne0, ne00, rows_packed, ne02, ne03,
+            src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3], p0, p1);
+    }
 }
