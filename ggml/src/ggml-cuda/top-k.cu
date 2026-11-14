@@ -88,18 +88,18 @@ static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
     return bits ^ mask;
 }
 
-struct top_k_radix_state {
+// one state per cache line, so the gather atomics of different rows do not compete
+struct alignas(128) top_k_radix_state {
     uint32_t prefix;
     uint32_t prefix_mask;
     int rank;
     int greater_count;
-    int equal_count;
 };
 
 static __global__ void top_k_radix_init(top_k_radix_state * states, int nrows, int k) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row < nrows) {
-        states[row] = {0, 0, k, 0, 0};
+        states[row] = {0, 0, k, 0};
     }
 }
 
@@ -109,6 +109,7 @@ static __global__ void top_k_radix_histogram(
         const top_k_radix_state * __restrict__ states,
         int * __restrict__ block_histograms,
         int ncols,
+        int block_cols,
         int blocks_per_row,
         int shift) {
     constexpr int NBINS = 1 << RADIX_BITS;
@@ -117,15 +118,15 @@ static __global__ void top_k_radix_histogram(
     const int row_block = blockIdx.x % blocks_per_row;
     const int tid = threadIdx.x;
     const float * row_src = src + (size_t) row * ncols;
+    const int64_t col_begin = (int64_t) row_block * block_cols;
+    const int64_t col_end   = min(col_begin + block_cols, (int64_t) ncols);
     __shared__ int histogram[NBINS];
 
     histogram[tid] = 0;
     __syncthreads();
 
     const top_k_radix_state state = states[row];
-    for (int64_t col = row_block * BLOCK_SIZE + tid;
-         col < ncols;
-         col += blocks_per_row * BLOCK_SIZE) {
+    for (int64_t col = col_begin + tid; col < col_end; col += BLOCK_SIZE) {
         const uint32_t key = top_k_float_to_ordered(row_src[col]);
         if ((key & state.prefix_mask) == state.prefix) {
             atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], 1);
@@ -309,6 +310,8 @@ static void top_k_radix_cuda(
     constexpr int RADIX_BITS = 8;
     constexpr int NBINS = 1 << RADIX_BITS;
     const int blocks_per_row = (int) std::min<int64_t>(((int64_t) ncols + 1023) / 1024, 64);
+    // each block of a row reads a contiguous range of whole tiles
+    const int block_cols = (int) (((int64_t) ncols + blocks_per_row * BLOCK_SIZE - 1) / (blocks_per_row * BLOCK_SIZE) * BLOCK_SIZE);
 
     // chunk the rows to bound the histogram memory to 64 MB
     const int64_t chunk_nrows = ggml_cuda_chunk_nrows((size_t) blocks_per_row * NBINS * sizeof(int), nrows);
@@ -327,7 +330,7 @@ static void top_k_radix_cuda(
         for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
             top_k_radix_histogram<BLOCK_SIZE, RADIX_BITS>
                 <<<row_grid, BLOCK_SIZE, 0, stream>>>(
-                    src, states, histograms, ncols, blocks_per_row, shift);
+                    src, states, histograms, ncols, block_cols, blocks_per_row, shift);
             top_k_radix_select<BLOCK_SIZE, RADIX_BITS>
                 <<<iter_nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
         }

@@ -144,7 +144,7 @@ A pipeline records one graph per stage and replays the stage transfer between th
 so a multi-stage split is captured as well, which it was not before:
 
 ```
-DeepSeek-V4.1-Flash MXFP4  -tps 2, 10 GPUs, 5 stages   23.0 -> 23.9 t/s decode
+DeepSeek-V4.1-Flash MXFP4  -tps 2, 10 GPUs, 5 stages   23.0 -> 23.9 t/s decode   (fork's pre-v0.9.0 V4.1 implementation)
 gpt-oss-120b MXFP4         -tps 2,  8 GPUs, 4 stages   82.2 -> 89.3 t/s decode
 Qwen3.8-27B-Q8             -tps 2,  4 GPUs, 2 stages   29.6 -> 31.3 t/s decode
 ```
@@ -179,31 +179,17 @@ output and identical draft acceptance.
 
 ## DeepSeek-V4.1-Flash architecture support
 
-V4.1 keeps V4's grouped-LoRA output projection and single-head KV latent, and changes three things the V4 path cannot express.
-Its compressed tiers are declared per layer in model metadata rather than keyed off V4's fixed compression ratio of 4, so the pooled compressor serves both of V4.1's tiers instead of only the plain one.
-The hyper-connection mix is shifted by one sublayer, so the mix a sublayer computes is consumed by the next one and the run starts from a one-hot mix that selects copy 0.
-V4.1 ships no `output_hc_*` head tensors and reuses the mix the last stage computed, so their absence selects the fold rather than failing the load.
-The per-head query norm V4 applies is absent in V4.1 and is dropped.
+DeepSeek-V4.1-Flash support is upstream llama.cpp's (#31086, v0.8.0).
+The fork carried its own implementation before that, under the same `deepseek41` architecture name but with a different GGUF layout, and the v0.9.0 merge replaced it with upstream's.
+GGUFs converted for the fork's implementation carry `deepseek41.engram.layer_ids` and `blk.N.engram_embed` tensors; they stop at load with a missing-key error and must be reconverted with `convert_hf_to_gguf.py`.
+Upstream's format keeps all Engram tables in one lazily read `per_layer_token_embd` tensor (BF16 from the converter; `llama-quantize` can requantize it) and gathers the rows in the graph.
+`LLAMA_PLE_SHARD` applies to Qwen3.8-Flash-Next only, not to these tables.
 
-Engram is an n-gram hash memory written into the hyper-connection residual at two layers.
-Each position hashes the 2-, 3- and 4-gram ending on it, once per head, giving row indices into that layer's table, and the rows become one key per hyper-connection copy plus a shared value added through a gate that measures how well the key matches the stream.
-The hash runs host side because it is int64 multiply, xor and modulo over the token history, none of which ggml has.
-The two tables are 48.6 GiB each and only a few rows are read per token, so they are mapped and read on demand rather than loaded as weights: put them on the fastest storage available.
-
-Measured on ten MI50 with a 16965-token prompt at temperature 0, `-sm layer`, `-ngl 41` with an explicit `-ts` split.
-The same greedy completion came back on every boot, so the architecture is reproducible, but prompt processing is not stable enough to quote as a single number: the two tables are 97 GiB against 32 GiB of host page cache, so throughput depends on which rows happen to be resident.
-
-```
-prefill  106 to 254 t/s     decode  12.5 to 13.9 t/s
-```
-
-The Engram gather is the dominant prompt-processing cost and is not yet solved.
-A 16965-token prompt takes about 678 thousand major faults and 63 GB of reads on a cold cache, and a load-time prefault of the tables makes it worse rather than better, because a 97 GiB sequential scan evicts the working set that demand paging had already assembled.
-
-Three diagnostic env gates ship with the support, all default off and each logging once when engaged: `LLAMA_DSV41_NO_ENGRAM` drops the Engram contribution, `LLAMA_DSV41_NO_COMPRESS` drops the compressed tier, and `LLAMA_DSV41_QNORM` restores the V4 query norm.
-
-Scope: `-sm layer`, and `-sm tensor -tps 2` since the incremental stage transfer for persistent caches, which reproduces its own output and beats layer mode on decode.
-Speculative decoding against a V4.1 DSpark sidecar is not supported yet.
+The fork keeps its tensor-parallel routing for V4.1: the design-B attention head split and the shared-expert split.
+Speculative decoding uses upstream's V4.1 DSpark drafter, selected by `hyper_connection.single_pass` in the sidecar.
+`LLAMA_DSV41_SPARSE=0` disables the sparse attention path.
+The fork's diagnostic gates `LLAMA_DSV41_NO_ENGRAM`, `LLAMA_DSV41_NO_COMPRESS`, `LLAMA_DSV41_QNORM` and `LLAMA_DSV41_HOST_INPUT_THREADS` are gone with the old implementation.
+V4.1 measurements elsewhere in this file were taken on the old implementation and have not been repeated on upstream's.
 
 ## Qwen3.8-Flash-Next tensor parallelism
 
@@ -344,7 +330,7 @@ stage-transfer path (`GGML_META_XFER_RCCL`) for the multi-stage pipeline.
 
 A multi-stage `-sm tensor` pipeline hands every mirrored tensor a later stage reads across the stage boundary.
 When the reader is a view of a persistent cache, the boundary tensor used to be the writer's set_rows output, which is the whole cache view, so each hop copied the full cache on every token, and each reading layer's own view of a shared cache added one more full copy.
-DeepSeek-V4.1 layers after a source layer read the source layer's caches, and on ten MI50 at `-tps 2` the stage 3 hop moved about 244 MB per token, which is where tensor decode lost to layer mode and why the prefill pipeline never filled.
+DeepSeek-V4.1 layers after a source layer read the source layer's caches, and on ten MI50 at `-tps 2` (measured on the fork's pre-v0.9.0 V4.1 implementation) the stage 3 hop moved about 244 MB per token, which is where tensor decode lost to layer mode and why the prefill pipeline never filled.
 The meta backend now keeps a host copy of the small integer inputs it is handed (the KV cell indices) and transfers a set_rows boundary as the dense cell range those indices name, a row block of each lane's own cache, exact bytes.
 A pure view of a persistent cache is served by the cache's writer once instead of one full copy per reading layer.
 Sparse or unknown indices fall back to the full copy, and `GGML_META_XFER_ROWS=0` restores the previous transfers.
@@ -367,8 +353,8 @@ Compute placement does not change, and `LLAMA_STAGE_LOCAL_MIRROR=0` restores a c
 Largest card VRAM, on ten MI50 unless noted, greedy outputs with top-5 records bit-identical with the copies on and off, prefill and decode unchanged:
 
 ```
-DeepSeek-V4.1-Flash MXFP4   -tps 2, 32k, ub 512, repack on   out of memory at load -> serves with 1.2 GiB free per card
-DeepSeek-V4.1-Flash MXFP4   -tps 2, 32k, ub 512, repack off  31374 -> 30496 MiB
+DeepSeek-V4.1-Flash MXFP4   -tps 2, 32k, ub 512, repack on   out of memory at load -> serves with 1.2 GiB free per card   (pre-v0.9.0 V4.1)
+DeepSeek-V4.1-Flash MXFP4   -tps 2, 32k, ub 512, repack off  31374 -> 30496 MiB   (pre-v0.9.0 V4.1)
 DeepSeek-V4-Flash MXFP4     -tps 2                            18876 -> 17936 MiB
 DeepSeek-V4-Flash MXFP4     -tps 4, 8 GPUs                    21780 -> 21178 MiB
 Qwen3.8-Flash-Next Q8_0     -tps 2                            17230 -> 16504 MiB
