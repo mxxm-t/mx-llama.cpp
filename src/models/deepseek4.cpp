@@ -1318,8 +1318,9 @@ llama_model_deepseek4::graph::graph(const llm_graph_params & params) :
     }();
 
     // one row index per hash column per table, hashed host side from the token history
+    // an embd ubatch is an image span, which the reference masks out of the engram entirely (gate 0, so the residual passes through)
     ggml_tensor * inp_engram = nullptr;
-    if (hparams.engram_n_layers > 0 && !engram_off) {
+    if (hparams.engram_n_layers > 0 && !engram_off && ubatch.token) {
         inp_engram = build_inp_engram(model);
         ggml_build_forward_expand(gf, inp_engram);
     }
@@ -1335,7 +1336,7 @@ llama_model_deepseek4::graph::graph(const llm_graph_params & params) :
         }
 
         // the engram writes into the residual before the block body, so the whole layer sees it.
-        if (!engram_off && model.layers[il].engram_embed) {
+        if (inp_engram && model.layers[il].engram_embed) {
             inpL = build_engram(model, inpL, inp_engram, il);
             cb(inpL, "engram_out", il);
         }

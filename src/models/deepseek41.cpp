@@ -156,6 +156,8 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
 
         layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, 0);
         layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, 0);
+        // image-span tokens route with their own bias (training noaux_tc_for_vl), only present in files made for mtmd
+        layer.ffn_exp_probs_b_vl = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B_VL, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
         layer.ffn_norm        = create_tensor(tn(LLM_TENSOR_FFN_NORM,        "weight", i), {n_embd}, 0);
 
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
@@ -250,9 +252,12 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
     std::vector<int32_t> idx(n_cols*n_tokens*n_eng);
     std::vector<int64_t> tok(n_gram);
 
+    // the graph builds no engram for an embd ubatch, as the reference gives image spans no engram contribution
+    // image cells keep a null token, so the look-back of the text after an image stops there, like the DEAD marker of the reference
+    GGML_ASSERT(ubatch->token != nullptr);
+
     for (int64_t i = 0; i < n_tokens; ++i) {
-        // an embd ubatch carries no ids; the reference gives image spans no engram contribution at all, and until that mask exists here, hashing them as padding is the closest stand-in
-        tok[0] = ubatch->token ? compress(ubatch->token[i]) : pad;
+        tok[0] = compress(ubatch->token[i]);
 
         // look-back stops at the start of the sequence, and everything at or before the cut pads
         bool cut = false;
