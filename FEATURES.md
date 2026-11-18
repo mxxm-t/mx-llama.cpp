@@ -203,7 +203,17 @@ A 16965-token prompt takes about 678 thousand major faults and 63 GB of reads on
 Three diagnostic env gates ship with the support, all default off and each logging once when engaged: `LLAMA_DSV41_NO_ENGRAM` drops the Engram contribution, `LLAMA_DSV41_NO_COMPRESS` drops the compressed tier, and `LLAMA_DSV41_QNORM` restores the V4 query norm.
 
 Scope: `-sm layer`, and `-sm tensor -tps 2` since the incremental stage transfer for persistent caches, which reproduces its own output and beats layer mode on decode.
-Speculative decoding against a V4.1 DSpark sidecar is not supported yet.
+Speculative decoding runs against the V4.1 DSpark sidecar (`-md <sidecar> --spec-type draft-dspark --spec-draft-n-max 3`).
+
+Image input runs through the upstream `deepseek41v` mmproj with `--mmproj`.
+Image tokens pick experts with the checkpoint's separate image router bias (`blk.N.exp_probs_b_vl.bias`, optional at load), and the Engram adds nothing on an image span, so the text after an image hashes as if the sequence started there, as DeepSeek's reference does.
+Text-only output is unchanged by either.
+On ten MI50 at `-c 32768`, image input together with DSpark needs `--no-mmproj-offload`, because the drafter, the vision encoder and the image buffers do not fit on device 0 together.
+
+```
+DeepSeek-V4.1-Flash-1017 MXFP4  ten MI50, -sm layer, DSpark n_max 3, --no-mmproj-offload
+  draft acceptance  text 0.53   corn 0.62   carrots 0.71
+```
 
 ## Qwen3.8-Flash-Next tensor parallelism
 
