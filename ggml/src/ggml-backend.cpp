@@ -1319,6 +1319,7 @@ struct ggml_backend_sched {
     int debug_realloc;
 
     // inputs of the next split read from the backend of the current split before it computes, see ggml_backend_sched_prefetch_inputs
+    // unused: the fork's split-input loop replaces upstream's input prefetch, kept pending the prefetch A/B
     ggml_backend_event_t prefetch_events[GGML_SCHED_MAX_BACKENDS]; // created on first use, NULL if the backend has no events
     bool                 prefetch_tried [GGML_SCHED_MAX_BACKENDS];
     struct ggml_tensor * prefetched[GGML_SCHED_MAX_SPLIT_INPUTS];

@@ -2240,6 +2240,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             llama_set_embeddings_nextn(params.ctx_tgt, false, false);
             llama_set_embeddings_nextn(params.ctx_dft, false, true);
             pre_norm_disabled = true;
+            std::fill(verify_row0.begin(), verify_row0.end(), -1);
+            std::fill(verify_h_rows.begin(), verify_h_rows.end(), 0);
             LOG_INF("%s: disabled MTP pre-norm extraction after all sequences disabled\n", __func__);
         }
     }
@@ -2247,6 +2249,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // Read the target h rows in place on the device; shared memory and chained heads keep the host rows.
     void set_dev_rows() {
         if (is_mem_shared || chain_heads) {
+            SPC_TRC("- target h rows on the device: %s\n", "no");
             return;
         }
         auto * ctx_tgt = params.ctx_tgt;
@@ -2256,6 +2259,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             llama_set_ctx_state_src(ctx_dft, nullptr);
             llama_set_embeddings_nextn_dev(ctx_tgt, false);
         }
+        SPC_TRC("- target h rows on the device: %s\n", dev_rows ? "yes" : "no");
     }
 
     // target h rows on the device (llama_set_embeddings_nextn_dev): the catch-up in process() reads row k - 1 of the last
@@ -2378,7 +2382,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (!deferred_prefill) {
             set_dev_rows();
         }
-        SPC_TRC("- target h rows on the device: %s\n", dev_rows ? "yes" : "no");
     }
 
     ~common_speculative_impl_draft_mtp() override {
