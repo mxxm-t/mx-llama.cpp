@@ -236,7 +236,7 @@ static __device__ __forceinline__ float rp_warp_reduce_sum(const float x) {
     if constexpr (width >=  8) { r += rp_dpp_xfer_xor4(r); }
     if constexpr (width >= 16) { r = rp_dpp_add_xor8(r); }
     if constexpr (width >= 32) { r += rp_dpp_xfer_xor16(r); }
-    if constexpr (width >= 64) { r += __shfl_xor_sync(0xffffffff, r, 32, 64); }
+    if constexpr (width >= 64) { r += ggml_cuda_shfl_xor(r, 32, 64); }
     return r;
 }
 

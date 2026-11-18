@@ -43,7 +43,7 @@ static __device__ __forceinline__ float gdn_group_sum(float x) {
 #else
 #pragma unroll
     for (int off = 1; off < W; off *= 2) {
-        x += __shfl_xor_sync(0xffffffff, x, off, W);
+        x += ggml_cuda_shfl_xor(x, off, W);
     }
     return x;
 #endif
