@@ -126,16 +126,6 @@ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llam
 // Useful for testing purposes.
 LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 
-// Set whether the context outputs nextn embeddings or not
-// If masked == true,  output the embeddings only for the tokens with batch.logits != 0
-// If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
-LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
-
-// Select which appended NextN block the DECODER_MTP graph runs (offset past
-// the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
-// chain multiple trained NextN heads. Default 0 (first head).
-LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
-
 // Phase 2b: when enabled, the MTP head graph builds and stores ONLY its K/V (skips the
 // discarded attention/FFN/output). Enable around the deferred-prefill replay (a pure prompt
 // KV-build whose head output is unused), disable for generation drafting (which needs logits).
@@ -166,26 +156,12 @@ LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch
 // Label of option i of a decision model ("<arch>.decision.labels"), nullptr past the last one
 LLAMA_API const char * llama_model_decision_label(const struct llama_model * model, uint32_t i);
 
-// mirrors:
-// LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
-LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
-
-// LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
-LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
-
-// Set whether the context outputs the input embeddings of a specific layer
-LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
-
 // Run any pending scheduler re-reserve now instead of inside the next decode.
 // Setters that change the graph topology (layer-input taps, samplers, loras)
 // only flag the reserve, and the next llama_decode then pays a full scheduler
 // rebuild plus worst-case graph reservation across all devices inside its
 // measured wall time. A no-op when nothing is pending.
 LLAMA_API void llama_sched_reserve(struct llama_context * ctx);
-
-// mirrors:
-// LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
-LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
 // Enable (n_tokens_cap > 0) or disable (0) a pinned position-indexed accumulation
 // buffer for the layer-input taps, one region per tap layer enabled at call time.
@@ -221,31 +197,9 @@ LLAMA_API bool llama_layer_inp_accum_ready(struct llama_context * ctx, llama_pos
 struct ggml_backend_event;
 GGML_API bool ggml_backend_event_query(struct ggml_backend_event * event);
 
-// Write the enabled layer inputs to a device buffer [n_layer_inp*n_embd, n_batch] instead of host memory.
-// Row r holds the token at batch index r, layers in ascending layer id order.
-LLAMA_API void llama_set_embeddings_layer_inp_dev(struct llama_context * ctx, bool value);
-
-// Whether decode accepts entries added with llama_batch_ext_add_embd_row()
-// (needs a DFlash/DSpark decoder context whose ctx_other has a layer input device buffer).
-LLAMA_API bool llama_supports_embd_row(const struct llama_context * ctx);
-
-// Add an entry whose embedding is row `row` of the layer input device buffer of ctx_other.
-// All entries of the batch must be of this kind. Positions are set with llama_batch_ext_set_pos(), n_pos_per_embd of them.
-// Returns the batch index (>= 0), or the llama_batch_ext_add() error codes.
-LLAMA_API int32_t llama_batch_ext_add_embd_row(struct llama_batch_ext * batch, llama_seq_id seq_id, int32_t row);
-
-LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
-
 //
 // model/context data extraction
 //
-
-LLAMA_API int32_t llama_model_dflash_selector_top_k(const struct llama_model * model);
-
-// returns pointer to the target-model layer indices
-LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
-// returns the number of extracted layers from target model
-LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
 
 // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
 // returns total number of elements or 0 on error

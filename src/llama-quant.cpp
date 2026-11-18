@@ -340,6 +340,14 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
         quantize &= name.find("mudd_")               == std::string::npos;
     }
 
+    // inkling2: short conv kernels, clip scales, residual mix queries and the relative bias projection
+    if (arch == LLM_ARCH_INKLING2) {
+        quantize &= name.find("_conv.weight")         == std::string::npos;
+        quantize &= name.find("_clip.weight")         == std::string::npos;
+        quantize &= name.find("_res_query.weight")    == std::string::npos;
+        quantize &= name.find("attn_rel_bias.weight") == std::string::npos;
+    }
+
     // do not quantize positional embeddings and token types (BERT)
     quantize &= name != LLM_TN(arch)(LLM_TENSOR_POS_EMBD,    "weight");
     quantize &= name != LLM_TN(arch)(LLM_TENSOR_TOKEN_TYPES, "weight");
@@ -369,6 +377,13 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
         quantize &= name.find("attn_pass_lora") == std::string::npos;
         quantize &= name.find("ffn_exp_embd")   == std::string::npos;
         quantize &= name.find("hc_")            == std::string::npos;
+    }
+
+    // kimi-k31: the indexer picks the top-k cells, so keep its projections accurate
+    if (arch == LLM_ARCH_KIMI_K31) {
+        quantize &= name.find("indexer.attn_q_b") == std::string::npos;
+        quantize &= name.find("indexer.attn_k")   == std::string::npos;
+        quantize &= name.find("indexer.proj")     == std::string::npos;
     }
 
     // glm5-next
