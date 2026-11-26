@@ -800,6 +800,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             }
         }
     }
+    // For value heads above 256 the tile kernel only has the instances that fold several query heads into a block:
+    // 2, 4 or 8 for 512/512, 4 or 16 for 576/512 (see ggml_cuda_flash_attn_ext_tile_case). A GQA ratio that is not a
+    // multiple of the smallest one (e.g. 576/512 with 2 query heads per KV head) is left to another backend.
+    if (V->ne[0] > 256 && gqa_ratio_eff < (Q->ne[0] == 576 ? 4 : 2)) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
     return BEST_FATTN_KERNEL_TILE;
 }
 
