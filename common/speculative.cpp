@@ -2616,6 +2616,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
             // h_tgt_in (deferred prefill) already holds the right rows, otherwise the rows of this batch come from the device buffer or the synchronizing getter.
+            // a sequence that starts at position 0 has no carried hidden state
+            // (before the rows are read: the device path uploads them right here)
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                const int k_beg = i_batch_beg[seq_id];
+                if (k_beg >= 0 && batch_in.tokens[k_beg].pos[0] == 0) {
+                    std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+                }
+            }
+
             if (dev) {
                 GGML_ASSERT(n_tokens <= n_batch_tgt && "the target batch exceeds the h_nextn device buffer");
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -2631,11 +2640,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const auto & t = batch_in.tokens[k];
 
                 const llama_seq_id seq_id = t.seq_id;
-
-                // a sequence that starts at position 0 has no carried hidden state
-                if (k == i_batch_beg[seq_id] && t.pos[0] == 0) {
-                    std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
-                }
 
                 // vision tokens carry an embedding instead of an id
                 const int32_t idx = t.id != LLAMA_TOKEN_NULL
