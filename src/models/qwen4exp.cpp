@@ -909,7 +909,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // which is the lightning indexer with every head weight set to that scale
     ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
     ggml_tensor * score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
-    res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
     cb(score, "indexer_score", il);
 
     const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
@@ -1268,10 +1267,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, model.layers[il].ffn_gate_up_exps,
-            model.layers[il].ffn_up_exps_s,
-            model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+            nullptr, model.layers[il].ffn_gate_up_exps);
     cb(moe_out, "ffn_moe_out", il);
 
     // shared experts, as in the Qwen3Next reference
@@ -1435,6 +1431,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         int64_t              channels,
         int                  il,
         bool                 keep_snapshots) {
+    if (cparams.rs_replay) {
+        return build_conv_state_replay(inp, conv_states_all, x, state_cols, channels, il);
+    }
+
     const auto * mctx_cur = inp->mctx;
 
     const int64_t n_seqs    = ubatch.n_seqs;

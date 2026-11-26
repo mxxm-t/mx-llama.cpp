@@ -19,6 +19,9 @@ public:
     // true if the per-token snapshot ring is active
     bool uses_ring() const { return ring_enabled; }
 
+    // true if a context of this shape rolls back through the snapshot ring (then it does not use rs_replay)
+    static bool ring_supported(const llama_model & model, uint32_t n_seq_max, uint32_t n_rs_seq, bool offload, bool verbose = false);
+
     llama_memory_recurrent(
             const llama_model & model,
                          bool   no_alloc,
@@ -28,6 +31,7 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
+                         bool   rs_replay,
         const layer_filter_cb & filter);
 
     ~llama_memory_recurrent() = default;
@@ -104,6 +108,8 @@ public:
     void stage_rs_seq(llama_seq_id seq_id);
     void finish_rs_pass(bool success);
     void advance_planes(llama_seq_id seq_id, uint32_t n_new);
+    // deferred commit: keep one state plane plus the inputs of the last ubatch, replay the accepted part in the next ubatch
+    bool rs_replay = false;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
@@ -121,8 +127,12 @@ public:
         int32_t   tail = -1;
 
         // largest rollback whose snapshot the last ubatch guarantees: a ubatch of n <= n_rs_seq + 1 tokens
-        // writes snapshots 0..n-1, a longer one only guarantees the final state (ggml_gated_delta_net)
+        // writes snapshots 0..n-1, a longer one only guarantees the final state (ggml_ssm_scan)
         uint32_t rs_max = 0;
+
+        // rs_replay: valid tokens in the pending rows, and the pending tokens the current ubatch replays
+        uint32_t rs_pend = 0;
+        uint32_t rs_rep  = 0;
 
         std::set<llama_seq_id> seq_id;
 
@@ -146,6 +156,10 @@ public:
     std::vector<ggml_tensor *> s_l;
     // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
+    // rs_replay pending gdn inputs: k, v, and the gates then the betas
+    std::vector<ggml_tensor *> spk_l;
+    std::vector<ggml_tensor *> spv_l;
+    std::vector<ggml_tensor *> spgb_l;
 
 private:
     //const llama_model & model;
@@ -215,12 +229,17 @@ public:
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;
+    ggml_tensor * get_spk_l (int32_t il) const;
+    ggml_tensor * get_spv_l (int32_t il) const;
+    ggml_tensor * get_spgb_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
 
     // Fill dst with physical rows ordered j + n_seqs*s, then advance each sequence ring.
     // Must run after s_copy() has consumed a pending rollback.
     void plan_snapshot_writes(int32_t * dst, uint32_t n_seqs, uint32_t n_snap) const;
+    bool     get_rs_replay() const;
+    uint32_t get_rs_rep(int i) const; // pending tokens replayed by ubatch seq i
 
 private:
     const llama_memory_status status;
