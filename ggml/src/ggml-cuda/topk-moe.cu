@@ -19,8 +19,10 @@ struct topk_moe_config {
 template <int experts_per_thread, bool use_limit>
 __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
     // Match the standalone softmax reduction order: reduce contiguous groups of
-    // WARP_SIZE values first, then reduce the group results. Keeping the fused and
+    // one row's values first, then reduce the group results. Keeping the fused and
     // unfused paths bitwise-equivalent prevents graph-layout-dependent routing.
+    // A row is one physical warp (64 lanes on GFX9), so every reduction names that width:
+    // the default width is WARP_SIZE = 32, which on a 64-lane row stays inside each half.
     float group_reductions[experts_per_thread];
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -29,7 +31,7 @@ __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const in
     for (int i = 0; i < experts_per_thread; i++) {
         const int  idx    = lane + i * warp_size;
         const bool active = !use_limit || (idx < limit);
-        group_reductions[i] = warp_reduce_max(active ? vals[i] : -INFINITY);
+        group_reductions[i] = warp_reduce_max<warp_size>(active ? vals[i] : -INFINITY);
     }
 
     float max_val = -INFINITY;
@@ -53,7 +55,7 @@ __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const in
         } else {
             vals[i] = 0.f;
         }
-        group_reductions[i] = warp_reduce_sum(vals[i]);
+        group_reductions[i] = warp_reduce_sum<warp_size>(vals[i]);
     }
 
     float sum = 0.f;
